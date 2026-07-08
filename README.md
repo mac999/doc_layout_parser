@@ -3,6 +3,11 @@
 A parser pipeline that reads drawing/document files (jpg, png, pdf), splits them into pages, classifies the layout of each page into **text / dimension /
 annotation / image / drawing** regions, extracts information per region type, and vectorizes drawing regions into polylines. Every extracted item carries its pixel coordinates.
 
+<p align="center">
+<img src=".doc/img1.png" height="200"></img> </br>
+<img src=".doc/img2.png" height="200"></img>
+</p>
+
 ## Overview
 
 ```
