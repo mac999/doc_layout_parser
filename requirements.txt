@@ -1,0 +1,16 @@
+# Core pipeline
+PyMuPDF>=1.26          # PDF page split, native text/vector extraction
+opencv-python>=4.10    # binarization, morphology, connected components, polyline simplification
+scikit-image>=0.26     # skeletonize (line thinning)
+numpy>=2.0
+easyocr>=1.7           # text detection/recognition (GPU, ko+en)
+shapely>=2.1           # optional geometry post-processing
+networkx>=3.0          # optional vector graph analysis
+
+# Result viewer (viewer.py web app)
+flask>=3.0
+
+# VLM/LLM integration (optional, selected by classify.provider in config.json)
+ollama>=0.6            # local VLM (llava and similar, fits in 8 GB VRAM)
+openai>=2.0            # OpenAI API (requires OPENAI_API_KEY)
+google-genai>=2.0      # Gemini API (requires GOOGLE_API_KEY)

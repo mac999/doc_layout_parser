@@ -1,0 +1,54 @@
+{
+  "input_dir": "input",
+  "output_dir": "output",
+  "preprocess": {
+    "upscale_target_min_side": 1400,
+    "max_scale": 3.0
+  },
+  "pdf": {
+    "render_dpi": 200,
+    "use_native_text": true,
+    "use_native_vectors": true,
+    "min_native_words": 5
+  },
+  "ocr": {
+    "languages": ["ko", "en"],
+    "gpu": true,
+    "min_confidence": 0.30,
+    "paragraph": false,
+    "mag_ratio": 1.0,
+    "canvas_size": 3200,
+    "min_size": 8,
+    "text_threshold": 0.6,
+    "low_text": 0.35
+  },
+  "layout": {
+    "min_region_area": 3000,
+    "text_mask_padding": 4,
+    "dilate_kernel": 21,
+    "max_page_cover_ratio": 1.0
+  },
+  "classify": {
+    "use_vlm": true,
+    "ambiguous_only": true,
+    "heuristic_confidence_threshold": 0.75,
+    "provider": "ollama",
+    "ollama_model": "llava:latest",
+    "openai_model": "gpt-4o-mini",
+    "gemini_model": "gemini-2.0-flash",
+    "timeout_sec": 60
+  },
+  "vectorize": {
+    "binarize_block_size": 35,
+    "binarize_C": 11,
+    "min_polyline_length_px": 8.0,
+    "simplify_epsilon": 2.0,
+    "bezier_samples": 8
+  },
+  "export": {
+    "save_page_image": true,
+    "save_region_crops": true,
+    "save_overlay": true,
+    "save_svg": true
+  }
+}
