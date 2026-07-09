@@ -94,12 +94,13 @@ def classify_text(text: str) -> str:
     return "text"
 
 
-def group_into_lines(items: list, gap_factor: float = 1.5) -> list:
+def group_into_lines(items: list, gap_factor: float = 1.5, row_factor: float = 0.6) -> list:
     """Merge word items that belong to the same text line.
 
-    Words whose vertical centers are close and whose horizontal gap is within
-    gap_factor times the character height are merged into one line. The bbox
-    of each individual word is preserved in the "words" list.
+    Words whose vertical centers are close (within row_factor times the
+    character height) and whose horizontal gap is within gap_factor times the
+    character height are merged into one line. The bbox of each individual
+    word is preserved in the "words" list.
     """
     if not items:
         return []
@@ -111,7 +112,7 @@ def group_into_lines(items: list, gap_factor: float = 1.5) -> list:
         y0, y1 = it["bbox"][1], it["bbox"][3]
         cy, h = (y0 + y1) / 2, max(y1 - y0, 1)
         for row in rows:
-            if abs(cy - row[-1]["_cy"]) < 0.6 * max(h, row[-1]["_h"]):
+            if abs(cy - row[-1]["_cy"]) < row_factor * max(h, row[-1]["_h"]):
                 row.append({**it, "_cy": cy, "_h": h})
                 break
         else:
@@ -146,18 +147,18 @@ def group_into_lines(items: list, gap_factor: float = 1.5) -> list:
     return merged
 
 
-def classify_line(line: dict) -> str:
+def classify_line(line: dict, max_tokens: int = 3, dim_ratio: float = 0.5) -> str:
     """Classify a merged line.
 
-    - Short lines (3 tokens or fewer): apply dimension/annotation patterns.
-    - Long lines (sentences): dimension only if most tokens look like
-      dimensions, otherwise plain text.
+    - Short lines (max_tokens or fewer): apply dimension/annotation patterns.
+    - Long lines (sentences): dimension only if the fraction of tokens that
+      look like dimensions exceeds dim_ratio, otherwise plain text.
     """
     tokens = line["text"].split()
-    if len(tokens) <= 3:
+    if len(tokens) <= max_tokens:
         return classify_text(line["text"])
     dim_hits = sum(1 for t in tokens if classify_text(t) == "dimension")
-    if dim_hits / len(tokens) > 0.5:
+    if dim_hits / len(tokens) > dim_ratio:
         return "dimension"
     return "text"
 
@@ -171,8 +172,11 @@ def get_text_items(page, cfg: dict) -> list:
     else:
         words = run_ocr(page.image, cfg)
         source = "ocr"
-    items = group_into_lines(words)
+    o = cfg["ocr"]
+    items = group_into_lines(words, gap_factor=o.get("line_gap_factor", 1.5),
+                             row_factor=o.get("line_row_factor", 0.6))
     for it in items:
-        it["type"] = classify_line(it)
+        it["type"] = classify_line(it, max_tokens=o.get("short_line_max_tokens", 3),
+                                   dim_ratio=o.get("dim_token_ratio", 0.5))
         it["source"] = source
     return items

@@ -44,13 +44,14 @@ def classify_with_vlm(crop: np.ndarray, cfg: dict) -> str | None:
     caller keeps the heuristic result."""
     c = cfg["classify"]
     provider = c["provider"]
+    max_side = c.get("vlm_max_image_side", 768)
     try:
         if provider == "ollama":
             import ollama
             resp = ollama.chat(
                 model=c["ollama_model"],
                 messages=[{"role": "user", "content": _PROMPT,
-                           "images": [_crop_to_png_b64(crop)]}],
+                           "images": [_crop_to_png_b64(crop, max_side)]}],
                 options={"temperature": 0},
             )
             return _parse_label(resp["message"]["content"])
@@ -65,7 +66,7 @@ def classify_with_vlm(crop: np.ndarray, cfg: dict) -> str | None:
                 messages=[{"role": "user", "content": [
                     {"type": "text", "text": _PROMPT},
                     {"type": "image_url", "image_url": {
-                        "url": f"data:image/png;base64,{_crop_to_png_b64(crop)}"}},
+                        "url": f"data:image/png;base64,{_crop_to_png_b64(crop, max_side)}"}},
                 ]}],
                 max_tokens=10, temperature=0,
             )

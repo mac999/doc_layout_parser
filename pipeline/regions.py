@@ -32,8 +32,12 @@ def mask_text(ink: np.ndarray, text_items: list, pad: int) -> np.ndarray:
     return out
 
 
-def detect_graphic_regions(page_img: np.ndarray, text_items: list, cfg: dict):
+def detect_graphic_regions(page_img: np.ndarray, text_items: list, cfg: dict,
+                           exclude_bboxes: list = None):
     """Detect graphic regions by clustering non-text ink.
+
+    exclude_bboxes: page areas already claimed (e.g. page-level tables);
+    their ink is erased so they do not produce regions again.
 
     Returns (regions, labels):
       regions: [{"bbox": [x0,y0,x1,y1], "label": component id}]
@@ -45,6 +49,16 @@ def detect_graphic_regions(page_img: np.ndarray, text_items: list, cfg: dict):
     gray = cv2.cvtColor(page_img, cv2.COLOR_BGR2GRAY)
     ink = binarize_ink(gray, cfg)
     ink = mask_text(ink, text_items, lay["text_mask_padding"])
+    if exclude_bboxes:
+        ink = mask_text(ink, [{"bbox": b} for b in exclude_bboxes],
+                        lay["text_mask_padding"])
+
+    # Scan/frame borders hugging the page edge would otherwise become tall
+    # thin "drawing" regions; erase the outermost strip of ink.
+    m = lay.get("page_border_margin_px", 0)
+    if m > 0:
+        ink[:m, :] = 0; ink[-m:, :] = 0
+        ink[:, :m] = 0; ink[:, -m:] = 0
 
     k = lay["dilate_kernel"]
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
@@ -64,30 +78,67 @@ def detect_graphic_regions(page_img: np.ndarray, text_items: list, cfg: dict):
     return regions, labels
 
 
-def classify_graphic_heuristic(crop: np.ndarray) -> tuple[str, float, dict]:
+def reclassify_text_regions(regions: list, cfg: dict) -> None:
+    """Override content-rule text types by geometric context.
+
+    Dimension/annotation/text rules are unreliable inside graphics, so any
+    text-based region lying mostly (text_region_overlap_ratio of its area)
+    inside a table becomes layout.text_in_table_type (default "text") and
+    inside a drawing becomes layout.text_in_drawing_type (default
+    "annotation"). Tables win when a table sits inside a drawing bbox.
+    """
+    lay = cfg["layout"]
+    min_ov = lay["text_region_overlap_ratio"]
+    tables = [r["bbox"] for r in regions if r["type"] == "table"]
+    drawings = [r["bbox"] for r in regions if r["type"] == "drawing"]
+
+    def frac_inside(tb, gb):
+        ix = max(0.0, min(tb[2], gb[2]) - max(tb[0], gb[0]))
+        iy = max(0.0, min(tb[3], gb[3]) - max(tb[1], gb[1]))
+        return ix * iy / max((tb[2] - tb[0]) * (tb[3] - tb[1]), 1e-6)
+
+    for r in regions:
+        if r["type"] not in ("text", "dimension", "annotation"):
+            continue
+        if any(frac_inside(r["bbox"], b) >= min_ov for b in tables):
+            new_type, tag = lay["text_in_table_type"], "in_table"
+        elif any(frac_inside(r["bbox"], b) >= min_ov for b in drawings):
+            new_type, tag = lay["text_in_drawing_type"], "in_drawing"
+        else:
+            continue
+        if new_type != r["type"]:
+            r["type"] = new_type
+            r["source"] = f'{r["source"]}+{tag}'
+
+
+def classify_graphic_heuristic(crop: np.ndarray, cfg: dict) -> tuple[str, float, dict]:
     """Decide whether a region is a line drawing or a raster image.
 
+    All thresholds/weights come from config classify.heuristic.
     Returns (label, confidence 0..1, metrics dict).
     - Drawing: white background with thin dark lines, so the mid-tone ratio
       and the saturation are both low.
     - Image/photo: continuous tone, so the mid-tone ratio or saturation is high.
     """
+    hh = cfg["classify"]["heuristic"]
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     sat_mean = float(hsv[:, :, 1].mean())
 
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     total = gray.size
-    mid_ratio = float(((gray > 60) & (gray < 200)).sum()) / total   # continuous-tone pixels
-    dark_ratio = float((gray <= 60).sum()) / total                  # ink pixels
+    dark_max, light_min = hh["dark_gray_max"], hh["light_gray_min"]
+    mid_ratio = float(((gray > dark_max) & (gray < light_min)).sum()) / total  # continuous-tone pixels
+    dark_ratio = float((gray <= dark_max).sum()) / total                       # ink pixels
 
     # Photo-likeness score: 0 = drawing, 1 = photo.
     photo_score = 0.0
-    photo_score += min(sat_mean / 60.0, 1.0) * 0.45          # colorful regions look like photos
-    photo_score += min(mid_ratio / 0.5, 1.0) * 0.45          # continuous tone looks like photos
-    photo_score += (0.10 if dark_ratio > 0.5 else 0.0)       # mostly-dark regions may be photos
+    photo_score += min(sat_mean / hh["sat_photo_norm"], 1.0) * hh["sat_weight"]  # colorful -> photo
+    photo_score += min(mid_ratio / hh["mid_photo_norm"], 1.0) * hh["mid_weight"] # continuous tone -> photo
+    photo_score += (hh["dark_ratio_bonus"] if dark_ratio > hh["dark_ratio_bonus_threshold"] else 0.0)
 
-    label = "image" if photo_score >= 0.5 else "drawing"
-    confidence = round(abs(photo_score - 0.5) * 2.0, 3)
+    thr = hh["photo_score_threshold"]
+    label = "image" if photo_score >= thr else "drawing"
+    confidence = round(min(abs(photo_score - thr) / max(thr, 1 - thr), 1.0), 3)
     metrics = {"sat_mean": round(sat_mean, 1), "mid_ratio": round(mid_ratio, 3),
                "dark_ratio": round(dark_ratio, 3), "photo_score": round(photo_score, 3)}
     return label, confidence, metrics

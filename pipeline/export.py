@@ -15,6 +15,7 @@ COLORS = {
     "annotation": (0, 165, 255),  # orange
     "drawing": (0, 180, 0),       # green
     "image": (200, 0, 200),       # purple
+    "table": (0, 200, 200),       # yellow
 }
 
 
@@ -32,6 +33,9 @@ def draw_overlay(page_img: np.ndarray, regions: list, vectors_by_region: dict) -
         cv2.rectangle(ov, (x0, y0), (x1, y1), color, 2)
         cv2.putText(ov, f'{r["id"]}:{r["type"]}', (x0, max(12, y0 - 4)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+        for cell in r.get("table", {}).get("cells", []):
+            cx0, cy0, cx1, cy1 = [int(round(c)) for c in cell["bbox"]]
+            cv2.rectangle(ov, (cx0, cy0), (cx1, cy1), color, 1)
     for polylines in vectors_by_region.values():
         for pl in polylines:
             pts = np.array(pl["points"], dtype=np.int32)
@@ -53,7 +57,7 @@ def export_page(page_dir: Path, page, regions: list, vectors_by_region: dict,
         crop_dir = page_dir / "regions"
         crop_dir.mkdir(exist_ok=True)
         for r in regions:
-            if r["type"] not in ("drawing", "image"):
+            if r["type"] not in ("drawing", "image", "table"):
                 continue
             x0, y0, x1, y1 = [int(round(c)) for c in r["bbox"]]
             crop = page.image[max(0, y0):min(h, y1), max(0, x0):min(w, x1)]
@@ -81,6 +85,19 @@ def export_page(page_dir: Path, page, regions: list, vectors_by_region: dict,
                 svg = polylines_to_svg(polylines, w, h)
                 (vec_dir / f"{rid}.svg").write_text(svg, encoding="utf-8")
                 region["svg_file"] = f"vectors/{rid}.svg"
+
+    table_regions = [r for r in regions if r.get("table")]
+    if table_regions:
+        tab_dir = page_dir / "tables"
+        tab_dir.mkdir(exist_ok=True)
+        for r in table_regions:
+            save_json(tab_dir / f'{r["id"]}.json', {
+                "region_id": r["id"],
+                "bbox": r["bbox"],
+                "coordinate_system": "page_pixel",
+                **r["table"],
+            })
+            r["table_file"] = f'tables/{r["id"]}.json'
 
     if native_vectors:
         save_json(page_dir / "native_vectors.json", {
