@@ -5,7 +5,9 @@ annotation / image / drawing** regions, extracts information per region type, an
 
 <p align="center">
 <img src="./doc/img1.png" width="500"></img> </br>
-<img src="./doc/img2.png" width="500"></img>
+<img src="./doc/img2.png" width="500"></img> </br>
+<img src="./doc/img3.png" width="500"></img> </br>
+<img src="./doc/img4.png" width="500"></img>
 </p>
 
 ## Overview
