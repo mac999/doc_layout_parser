@@ -20,13 +20,21 @@
     "canvas_size": 3200,
     "min_size": 8,
     "text_threshold": 0.6,
-    "low_text": 0.35
+    "low_text": 0.35,
+    "line_gap_factor": 1.5,
+    "line_row_factor": 0.6,
+    "short_line_max_tokens": 3,
+    "dim_token_ratio": 0.5
   },
   "layout": {
     "min_region_area": 3000,
     "text_mask_padding": 4,
     "dilate_kernel": 21,
-    "max_page_cover_ratio": 1.0
+    "max_page_cover_ratio": 1.0,
+    "page_border_margin_px": 8,
+    "text_in_drawing_type": "annotation",
+    "text_in_table_type": "text",
+    "text_region_overlap_ratio": 0.5
   },
   "classify": {
     "use_vlm": true,
@@ -36,7 +44,41 @@
     "ollama_model": "llava:latest",
     "openai_model": "gpt-4o-mini",
     "gemini_model": "gemini-2.0-flash",
-    "timeout_sec": 60
+    "timeout_sec": 60,
+    "vlm_max_image_side": 768,
+    "heuristic": {
+      "dark_gray_max": 60,
+      "light_gray_min": 200,
+      "sat_photo_norm": 60.0,
+      "mid_photo_norm": 0.5,
+      "sat_weight": 0.45,
+      "mid_weight": 0.45,
+      "dark_ratio_bonus_threshold": 0.5,
+      "dark_ratio_bonus": 0.10,
+      "photo_score_threshold": 0.5
+    }
+  },
+  "table": {
+    "enable": true,
+    "min_rows": 2,
+    "min_cols": 2,
+    "line_kernel_divisor": 20,
+    "min_line_length_ratio": 0.35,
+    "boundary_merge_tol_px": 10,
+    "min_intersection_ratio": 0.55,
+    "separator_coverage": 0.45,
+    "min_cell_size_px": 12,
+    "min_grid_cover_ratio": 0.5,
+    "max_stray_ink_ratio": 0.008,
+    "min_line_kernel_px": 10,
+    "stray_dilate_px": 5,
+    "merge_max_gap_px": 200,
+    "merge_axis_overlap": 0.8,
+    "merge_bridge_coverage": 0.9,
+    "page_level_detection": true,
+    "network_gap_px": 3,
+    "min_boundary_span_ratio": 0.6,
+    "min_cell_text_ratio": 0.45
   },
   "vectorize": {
     "binarize_block_size": 35,

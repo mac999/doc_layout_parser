@@ -1,9 +1,10 @@
 """Entry point of the drawing/document parsing pipeline.
 
 Splits every jpg/png/pdf in the input folder into pages, classifies each
-page layout into text / annotation / dimension / image / drawing regions,
-extracts information per region type (OCR text, crops, vectorization) and
-saves the results under output/<file_name>/page_NNN/.
+page layout into text / annotation / dimension / image / drawing / table
+regions, extracts information per region type (OCR text, crops,
+vectorization, table structure with per-cell text) and saves the results
+under output/<file_name>/page_NNN/.
 
 Usage:
     python main.py                     # process everything in config input_dir
@@ -11,6 +12,7 @@ Usage:
     python main.py -c my_config.json   # use a different configuration file
 """
 import argparse
+import shutil
 import sys
 import time
 import traceback
@@ -19,7 +21,8 @@ from pathlib import Path
 from pipeline.config import load_config
 from pipeline.loader import load_pages, maybe_upscale, IMAGE_EXTS
 from pipeline.ocr import get_text_items
-from pipeline.regions import detect_graphic_regions, classify_graphic_heuristic
+from pipeline.regions import detect_graphic_regions, classify_graphic_heuristic, reclassify_text_regions
+from pipeline.table import try_parse_table, merge_split_tables, detect_page_tables
 from pipeline.vlm import classify_with_vlm
 from pipeline.vectorize import vectorize_region
 from pipeline.export import export_page, save_json
@@ -46,18 +49,43 @@ def process_page(page, cfg: dict, page_dir: Path) -> dict:
             "words": it.get("words", []),
         })
 
-    # 2) Graphic region detection, then drawing / image classification.
+    # 2) Page-level table detection from the raw ruling-line network (text
+    #    masking can fragment a table's ink, the printed lines stay whole).
+    page_tables = detect_page_tables(page.image, text_items, cfg)
+    for pt in page_tables:
+        rid += 1
+        table = pt["table"]
+        regions.append({
+            "id": f"r{rid:03d}",
+            "type": "table",
+            "bbox": [float(v) for v in pt["bbox"]],
+            "confidence": table.pop("confidence"),
+            "source": "table_grid",
+            "table": table,
+        })
+
+    # 3) Graphic region detection (page-table areas excluded), then
+    #    table / drawing / image classification. Table check (ruling-line
+    #    grid) runs first; non-tables keep the existing heuristic +
+    #    optional VLM path unchanged.
     cls_cfg = cfg["classify"]
-    graphic_regions, labels = detect_graphic_regions(page.image, text_items, cfg)
+    graphic_regions, labels = detect_graphic_regions(
+        page.image, text_items, cfg, exclude_bboxes=[pt["bbox"] for pt in page_tables])
+    # Reunite tables whose ink was split into several components by text
+    # masking (merged entries carry the parsed table already).
+    graphic_regions = merge_split_tables(page.image, graphic_regions, text_items, cfg)
     drawing_regions = []
     for g in graphic_regions:
         bbox = g["bbox"]
-        x0, y0, x1, y1 = bbox
+        x0, y0, x1, y1 = [int(round(c)) for c in bbox]
         crop = page.image[y0:y1, x0:x1]
-        label, conf, metrics = classify_graphic_heuristic(crop)
+        label, conf, metrics = classify_graphic_heuristic(crop, cfg)
         method = "heuristic"
-        if cls_cfg["use_vlm"] and (not cls_cfg["ambiguous_only"]
-                                   or conf < cls_cfg["heuristic_confidence_threshold"]):
+        table = g.get("table") or try_parse_table(crop, bbox, text_items, cfg)
+        if table is not None:
+            label, conf, method = "table", table.pop("confidence"), "table_grid"
+        elif cls_cfg["use_vlm"] and (not cls_cfg["ambiguous_only"]
+                                     or conf < cls_cfg["heuristic_confidence_threshold"]):
             vlm_label = classify_with_vlm(crop, cfg)
             if vlm_label:
                 label, conf, method = vlm_label, 0.9, f'vlm:{cls_cfg["provider"]}'
@@ -70,11 +98,17 @@ def process_page(page, cfg: dict, page_dir: Path) -> dict:
             "source": method,
             "metrics": metrics,
         }
+        if table is not None:
+            region["table"] = table
         regions.append(region)
         if label == "drawing":
             drawing_regions.append((region, g["label"]))
 
-    # 3) Vectorize drawing regions (connected segments become polylines,
+    # Geometric context overrides content rules: text-based regions inside a
+    # table become plain text, inside a drawing become annotation.
+    reclassify_text_regions(regions, cfg)
+
+    # 4) Vectorize drawing regions (connected segments become polylines,
     #    coordinates are page pixels).
     vectors_by_region = {}
     for region, comp_label in drawing_regions:
@@ -89,8 +123,14 @@ def process_page(page, cfg: dict, page_dir: Path) -> dict:
 
 
 def process_file(file_path: Path, cfg: dict, out_root: Path) -> dict:
-    """Process one input file page by page and write a per-file summary."""
+    """Process one input file page by page and write a per-file summary.
+
+    The file's output folder is recreated from scratch so no stale results
+    from a previous run (renamed crops, removed tables/vectors) survive.
+    """
     out_dir = out_root / file_path.stem
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"\n=== {file_path.name} ===")
 

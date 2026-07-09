@@ -93,7 +93,7 @@ PAGE = r"""<!doctype html>
   --bg:#0e1015; --panel:#151821; --panel2:#1a1e2a; --border:#262c3b;
   --fg:#dfe4ee; --fg-dim:#8a93a8; --accent:#4f8cff; --accent-dim:#2a3f66;
   --c-text:#3b9dff; --c-dimension:#ff5252; --c-annotation:#ffa726;
-  --c-drawing:#2ecc71; --c-image:#d05ce3;
+  --c-drawing:#2ecc71; --c-image:#d05ce3; --c-table:#e0c341;
   --radius:10px; --font:13px/1.5 "Segoe UI","Malgun Gothic",system-ui,sans-serif;
 }
 *{box-sizing:border-box; margin:0}
@@ -165,6 +165,8 @@ body.resizing iframe, body.resizing img, body.resizing-v img{pointer-events:none
 #ov .rgn:hover rect{fill:rgba(255,255,255,.07)}
 #ov .rgn.sel rect{stroke-width:3.5; fill:rgba(79,140,255,.10)}
 #ov .rgn text{font:600 13px sans-serif; paint-order:stroke; stroke:#000a; stroke-width:3px; pointer-events:none}
+#ov .rgn rect.cell{stroke-width:1; opacity:.7; pointer-events:none}
+#ov .rgn:hover rect.cell, #ov .rgn.sel rect.cell{fill:transparent}
 #ov .vec path{fill:none; stroke-width:1.2; vector-effect:non-scaling-stroke; pointer-events:none}
 #empty{position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
   color:var(--fg-dim); font-size:14px; flex-direction:column; gap:8px}
@@ -196,6 +198,10 @@ body.resizing iframe, body.resizing img, body.resizing-v img{pointer-events:none
 #rdetail td:first-child{color:var(--fg-dim); width:88px; white-space:nowrap}
 #rdetail .txtbox{background:var(--panel2); border:1px solid var(--border); border-radius:8px;
   padding:8px 10px; font-size:12.5px; margin-bottom:10px; word-break:break-all; white-space:pre-wrap}
+#rdetail .cellgrid-wrap{overflow-x:auto; margin-bottom:10px}
+#rdetail table.cellgrid{width:auto; min-width:100%; font-size:11.5px}
+#rdetail table.cellgrid td{border:1px solid var(--border); background:var(--panel2);
+  padding:4px 7px; color:var(--fg); width:auto; white-space:normal; word-break:break-all}
 #rdetail .imgbox{background:#fff; border:1px solid var(--border); border-radius:8px; overflow:hidden; margin-bottom:10px}
 #rdetail .imgbox img, #rdetail .imgbox svg{display:block; width:100%; height:auto; max-height:260px; object-fit:contain}
 #rdetail .cap{font-size:10.5px; color:var(--fg-dim); margin:-6px 0 10px 2px}
@@ -260,8 +266,8 @@ body.resizing iframe, body.resizing img, body.resizing-v img{pointer-events:none
 
 <script>
 "use strict";
-const TYPE_COLORS = {text:"#3b9dff", dimension:"#ff5252", annotation:"#ffa726", drawing:"#2ecc71", image:"#d05ce3"};
-const TYPE_LABELS = {text:"텍스트", dimension:"치수", annotation:"주석", drawing:"도면", image:"이미지"};
+const TYPE_COLORS = {text:"#3b9dff", dimension:"#ff5252", annotation:"#ffa726", drawing:"#2ecc71", image:"#d05ce3", table:"#e0c341"};
+const TYPE_LABELS = {text:"텍스트", dimension:"치수", annotation:"주석", drawing:"도면", image:"이미지", table:"표"};
 const GROUP_PALETTE = ["#2ecc71","#3b9dff","#ff8f3d","#d05ce3","#00c2c7","#ffd23b","#ff5252","#9fd63b",
                        "#7a7cff","#ff7ab8","#5bd0ff","#c0a06a"];
 const $ = s => document.querySelector(s);
@@ -275,7 +281,7 @@ const enc = encodeURIComponent;
 const state = {
   files: [], file: null, page: null, layout: null, selId: null,
   base: "page", layers: {bbox:true, vec:false, native:false},
-  types: {text:true, dimension:true, annotation:true, drawing:true, image:true},
+  types: {text:true, dimension:true, annotation:true, drawing:true, image:true, table:true},
   view: {x:0, y:0, k:1},
   vecCache: {}, nativeCache: {}, detailTab: "crop",
 };
@@ -382,6 +388,11 @@ function renderRegions(){
     const color = TYPE_COLORS[r.type] || "#999";
     const g = svgEl("g", {class:"rgn" + (r.id===state.selId ? " sel" : ""), "data-id":r.id});
     g.appendChild(svgEl("rect", {x:x0, y:y0, width:x1-x0, height:y1-y0, stroke:color}));
+    for(const c of (r.table?.cells || [])){
+      const [cx0,cy0,cx1,cy1] = c.bbox;
+      g.appendChild(svgEl("rect", {class:"cell", x:cx0, y:cy0, width:cx1-cx0, height:cy1-cy0,
+                                   stroke:color, "vector-effect":"non-scaling-stroke"}));
+    }
     const t = svgEl("text", {x:x0+3, y:Math.max(14, y0-5), fill:color});
     t.textContent = `${r.id} ${r.type}`;
     g.appendChild(t);
@@ -469,6 +480,7 @@ function snippet(r){
   if(r.text) return r.text;
   if(r.type === "drawing") return `폴리라인 ${r.num_polylines ?? 0}개`;
   if(r.type === "image") return "래스터 이미지";
+  if(r.type === "table" && r.table) return `표 ${r.table.rows}행×${r.table.cols}열`;
   return "";
 }
 function renderList(){
@@ -487,6 +499,26 @@ function renderList(){
 }
 
 /* ---------------- selection & detail ---------------- */
+function cellGridHtml(t){
+  // Rebuild the parsed table as an HTML table (rowspan/colspan preserved).
+  const cellAt = {}, covered = {};
+  for(const c of t.cells) cellAt[c.row + "," + c.col] = c;
+  let html = `<div class="cellgrid-wrap"><table class="cellgrid">`;
+  for(let i = 0; i < t.rows; i++){
+    html += "<tr>";
+    for(let j = 0; j < t.cols; j++){
+      if(covered[i + "," + j]) continue;
+      const c = cellAt[i + "," + j];
+      if(!c) continue;
+      for(let a = 0; a < c.row_span; a++)
+        for(let b = 0; b < c.col_span; b++) covered[(i + a) + "," + (j + b)] = true;
+      html += `<td rowspan="${c.row_span}" colspan="${c.col_span}">${esc(c.text || "")}</td>`;
+    }
+    html += "</tr>";
+  }
+  return html + `</table></div><div class="cap">파싱된 표 구조 (병합 셀 반영)</div>`;
+}
+
 function selectRegion(id){
   state.selId = id;
   document.querySelectorAll("#rgnLayer .rgn").forEach(g => g.classList.toggle("sel", g.dataset.id===id));
@@ -517,8 +549,10 @@ async function renderDetail(){
       .map(([k,v])=>`${k}=${v}`).join(", ")}</td></tr>`;
   if(r.words?.length) html += `<tr><td>단어 수</td><td>${r.words.length}</td></tr>`;
   if(r.num_polylines) html += `<tr><td>폴리라인</td><td>${r.num_polylines}개</td></tr>`;
+  if(r.table) html += `<tr><td>표 구조</td><td>${r.table.rows}행 × ${r.table.cols}열, 셀 ${r.table.num_cells}개</td></tr>`;
   html += `</table>`;
   if(r.text) html += `<div class="txtbox">${esc(r.text)}</div>`;
+  if(r.table) html += cellGridHtml(r.table);
 
   const hasCrop = !!r.image_file, hasVec = !!r.vector_file;
   if(hasCrop || hasVec){

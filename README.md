@@ -1,7 +1,7 @@
 # Doc layout parser
 
 A parser pipeline that reads drawing/document files (jpg, png, pdf), splits them into pages, classifies the layout of each page into **text / dimension /
-annotation / image / drawing** regions, extracts information per region type, and vectorizes drawing regions into polylines. Every extracted item carries its pixel coordinates.
+annotation / image / drawing / table** regions, extracts information per region type (table structure with per-cell text included), and vectorizes drawing regions into polylines. Every extracted item carries its pixel coordinates.
 
 <p align="center">
 <img src="./doc/img4.png" width="500"></img> </br>
@@ -21,11 +21,31 @@ input/*.{jpg,png,pdf}
   |    +- Text detection: EasyOCR (GPU) or PDF native words
   |    |    -> words are merged into lines
   |    |    -> rule-based classification: text / dimension / annotation
+  |    +- Page-level table detection: long horizontal/vertical ruling
+  |    |    lines are extracted from the raw page; each connected line
+  |    |    network becomes a table candidate parsed by the table gates
+  |    |    (tables are found whole even when text masking would cut
+  |    |     their ink into fragments; detected areas are excluded from
+  |    |     graphic region detection below)
   |    +- Graphic region detection: binarization + text masking +
   |    |    morphological dilation + connected components
-  |    |    -> drawing / image classification: heuristics (saturation,
-  |    |       mid-tone ratio, ink ratio), optionally refined by a VLM
-  |    |       (Ollama llava / OpenAI / Gemini)
+  |    |    (ink hugging the page edge is erased first so scan/frame
+  |    |     borders do not become regions)
+  |    |    -> split-table merge fallback: aligned neighbouring regions
+  |    |       whose gap is crossed by printed ruling lines are unioned
+  |    |       when the union parses as a table
+  |    |    -> table check first: ruling-line lattice detection
+  |    |       (long horizontal/vertical lines, crossing coverage;
+  |    |        drawings are rejected by stray-ink, boundary-span and
+  |    |        cell-text-occupancy gates)
+  |    |       -> row/col boundaries, merged-cell spans, per-cell text
+  |    |    -> non-tables: drawing / image classification: heuristics
+  |    |       (saturation, mid-tone ratio, ink ratio), optionally refined
+  |    |       by a VLM (Ollama llava / OpenAI / Gemini)
+  |    +- Geometric reclassification: content rules are unreliable inside
+  |    |    graphics, so text-based regions lying mostly inside a table
+  |    |    become plain "text" and inside a drawing become "annotation"
+  |    |    (numbers included; the source field gets +in_table/+in_drawing)
   +- Vectorization of drawing regions:
        adaptive binarization -> skeletonize -> pixel-graph tracing
        -> connected segments merged into polylines (closed loops supported)
@@ -39,6 +59,9 @@ be mapped back to the original image.
 
 ## Output structure
 
+Each run deletes and recreates `output/<file_name>/` for the files it
+processes, so no stale results from a previous run survive.
+
 ```
 output/<file_name>/
   result.json                 # file summary (page count, region counts)
@@ -47,11 +70,15 @@ output/<file_name>/
     layout.json               # regions: id, type, bbox [x0,y0,x1,y1], text,
                               # confidence, words, source, ...
     overlay.png               # visualization (blue=text, red=dimension,
-                              # orange=annotation, green=drawing, purple=image)
-    regions/rNNN_drawing.png  # crops of drawing/image regions
+                              # orange=annotation, green=drawing, purple=image,
+                              # yellow=table incl. cell boxes)
+    regions/rNNN_drawing.png  # crops of drawing/image/table regions
     vectors/rNNN.json         # polylines: points [[x,y],...], closed,
                               # length_px, group
     vectors/rNNN.svg          # vectorization result as SVG
+    tables/rNNN.json          # table structure: rows, cols, row/col
+                              # boundaries, cells [{row, col, row_span,
+                              # col_span, bbox, text}]
     native_vectors.json       # native vector paths (vector PDFs only)
 ```
 
@@ -133,12 +160,18 @@ Features:
 - **Layers**: region boxes, vectorized polylines, native PDF vectors (vector PDFs)
 - **Region list & detail**: click a region on the canvas or in the list to see
   its type, confidence, bbox, OCR text, crop image and the vectorized polylines
-  rendered as SVG (colored per connectivity group), plus "zoom to region"
-- **Type filter**: show/hide text / dimension / annotation / drawing / image regions
+  rendered as SVG (colored per connectivity group), plus "zoom to region";
+  table regions additionally show the parsed cell grid (merged cells preserved)
+- **Type filter**: show/hide text / dimension / annotation / drawing / image / table regions
 
 No external service is needed for the viewer (Ollama is not used here).
 
 ## Configuration (config.json)
+
+Every tuned threshold and heuristic weight in the pipeline lives in
+`config.json` (defaults in `pipeline/config.py`); nothing input-specific is
+hardcoded in the modules, so the pipeline can be adapted to other document
+styles by editing the configuration only.
 
 | Key | Description |
 |---|---|
@@ -150,11 +183,30 @@ No external service is needed for the viewer (Ollama is not used here).
 | `pdf.use_native_vectors` | Extract embedded PDF vector paths |
 | `ocr.languages`, `ocr.gpu` | EasyOCR languages and GPU switch |
 | `ocr.min_confidence` | Drop OCR results below this confidence |
+| `ocr.line_gap_factor`, `ocr.line_row_factor` | Word-to-line merging: max horizontal gap / vertical center distance as a multiple of the character height |
+| `ocr.short_line_max_tokens`, `ocr.dim_token_ratio` | Line classification: token count treated as a "short line", and the dimension-token fraction above which a long line counts as a dimension |
 | `layout.min_region_area` | Minimum graphic region size (px^2) |
 | `layout.dilate_kernel` | Dilation kernel size used to merge nearby ink into regions |
+| `layout.page_border_margin_px` | Erase ink within this margin of the page edges (drops scan/frame border artifacts) |
+| `layout.text_in_drawing_type`, `layout.text_in_table_type` | Type given to text-based regions inside a drawing (default `annotation`) / inside a table (default `text`) |
+| `layout.text_region_overlap_ratio` | Fraction of a text region's area that must lie inside the graphic bbox to trigger the reclassification |
 | `classify.use_vlm` | Enable VLM-based drawing/image re-classification |
 | `classify.ambiguous_only` | Call the VLM only when the heuristic is uncertain |
 | `classify.provider` | `ollama` / `openai` / `gemini` |
+| `classify.vlm_max_image_side` | Downscale region crops to this size before sending them to the VLM |
+| `classify.heuristic.*` | All thresholds/weights of the drawing/image heuristic (gray-level bounds `dark_gray_max`/`light_gray_min`, normalizers `sat_photo_norm`/`mid_photo_norm`, weights `sat_weight`/`mid_weight`/`dark_ratio_bonus`, decision point `photo_score_threshold`) |
+| `table.enable` | Enable ruling-line table detection/parsing |
+| `table.min_rows`, `table.min_cols` | Minimum grid size to accept a table |
+| `table.min_line_length_ratio` | Ruling lines must be longer than this ratio of the region side |
+| `table.min_intersection_ratio` | Required fraction of row×col boundary crossings with ink |
+| `table.separator_coverage` | Ruling coverage needed on a cell border; below it cells merge into spans |
+| `table.max_stray_ink_ratio` | Max non-ruling, non-text ink inside the grid; above it the region is a drawing, not a table |
+| `table.min_line_kernel_px`, `table.stray_dilate_px` | Lower bound of the ruling-line morphology kernel / line-mask dilation used by the stray-ink check |
+| `table.merge_max_gap_px`, `table.merge_axis_overlap` | Split-table merge: max gap between aligned neighbouring regions / required bbox alignment along the other axis |
+| `table.merge_bridge_coverage` | Fraction of the gap a printed ruling line must cross for two regions to count as one split table |
+| `table.page_level_detection`, `table.network_gap_px` | Detect tables from the page's connected ruling-line networks / bridge line breaks up to this size when connecting them |
+| `table.min_boundary_span_ratio` | Every ruling line must cover this fraction of the grid extent (crossing lines in drawings leave short boundaries) |
+| `table.min_cell_text_ratio` | Fraction of cells that must contain text; mostly-empty lattices (drawing line networks) are rejected. Lower it for form-style tables with many blank cells |
 | `vectorize.simplify_epsilon` | Polyline simplification strength (px) |
 | `vectorize.min_polyline_length_px` | Drop polylines shorter than this (noise filter) |
 
