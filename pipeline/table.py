@@ -423,3 +423,42 @@ def merge_split_tables(page_img: np.ndarray, graphic_regions: list,
             if changed:
                 break
     return regions
+
+
+def _frac_inside(inner: list, outer: list) -> float:
+    """Fraction of *inner*'s area covered by *outer*."""
+    ix = max(0.0, min(inner[2], outer[2]) - max(inner[0], outer[0]))
+    iy = max(0.0, min(inner[3], outer[3]) - max(inner[1], outer[1]))
+    return ix * iy / max((inner[2] - inner[0]) * (inner[3] - inner[1]), 1e-6)
+
+
+def dedupe_table_regions(regions: list, min_overlap: float = 0.6) -> list:
+    """
+    Drop table regions that describe a table another region already covers.
+
+    A ruled table can be found twice: once by the page-level line pass and once
+    from its own graphic component, so the same grid is reported by two
+    overlapping regions — usually an outer box that also swallows the table's
+    border as an extra row and column. Of an overlapping pair keep the more
+    confident parse, then the denser grid, which is the one whose rows and
+    columns match the printed rules.
+    """
+    tables = [r for r in regions if r.get("type") == "table"]
+    if len(tables) < 2:
+        return regions
+
+    def rank(region: dict) -> tuple:
+        table = region.get("table") or {}
+        rows, cols = int(table.get("rows", 0)), int(table.get("cols", 0))
+        filled = sum(1 for c in table.get("cells", []) if (c.get("text") or "").strip())
+        return (float(region.get("confidence", 0.0)), filled / max(rows * cols, 1))
+
+    kept, dropped = [], set()
+    for region in sorted(tables, key=rank, reverse=True):
+        bbox = region["bbox"]
+        if any(_frac_inside(bbox, k["bbox"]) >= min_overlap
+               or _frac_inside(k["bbox"], bbox) >= min_overlap for k in kept):
+            dropped.add(region["id"])
+        else:
+            kept.append(region)
+    return [r for r in regions if r["id"] not in dropped]

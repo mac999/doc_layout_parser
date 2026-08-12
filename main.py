@@ -22,7 +22,8 @@ from pipeline.config import load_config
 from pipeline.loader import load_pages, maybe_upscale, IMAGE_EXTS
 from pipeline.ocr import get_text_items
 from pipeline.regions import detect_graphic_regions, classify_graphic_heuristic, reclassify_text_regions
-from pipeline.table import try_parse_table, merge_split_tables, detect_page_tables
+from pipeline.table import (try_parse_table, merge_split_tables, detect_page_tables,
+                            dedupe_table_regions)
 from pipeline.vlm import classify_with_vlm
 from pipeline.vectorize import vectorize_region
 from pipeline.export import export_page, save_json
@@ -103,6 +104,10 @@ def process_page(page, cfg: dict, page_dir: Path) -> dict:
         regions.append(region)
         if label == "drawing":
             drawing_regions.append((region, g["label"]))
+
+    # The page-level pass and the graphic pass can each report the same table,
+    # so drop the weaker copy before anything downstream reads the regions.
+    regions = dedupe_table_regions(regions)
 
     # Geometric context overrides content rules: text-based regions inside a
     # table become plain text, inside a drawing become annotation.
