@@ -24,10 +24,10 @@ def mask_text(ink: np.ndarray, text_items: list, pad: int) -> np.ndarray:
     """Return the ink mask with all text boxes erased (set to 0)."""
     out = ink.copy()
     h, w = out.shape
-    for it in text_items:
+    for it in [word for item in text_items for word in (item.get("words") or [item])]:
         x0, y0, x1, y1 = it["bbox"]
-        x0 = max(0, int(x0) - pad); y0 = max(0, int(y0) - pad)
-        x1 = min(w, int(x1) + pad); y1 = min(h, int(y1) + pad)
+        x0 = min(w, max(0, int(np.floor(x0)) - pad)); y0 = min(h, max(0, int(np.floor(y0)) - pad))
+        x1 = max(0, min(w, int(np.ceil(x1)) + pad)); y1 = max(0, min(h, int(np.ceil(y1)) + pad))
         out[y0:y1, x0:x1] = 0
     return out
 
@@ -79,14 +79,7 @@ def detect_graphic_regions(page_img: np.ndarray, text_items: list, cfg: dict,
 
 
 def reclassify_text_regions(regions: list, cfg: dict) -> None:
-    """Override content-rule text types by geometric context.
-
-    Dimension/annotation/text rules are unreliable inside graphics, so any
-    text-based region lying mostly (text_region_overlap_ratio of its area)
-    inside a table becomes layout.text_in_table_type (default "text") and
-    inside a drawing becomes layout.text_in_drawing_type (default
-    "annotation"). Tables win when a table sits inside a drawing bbox.
-    """
+    """Preserve semantic types independently of table/drawing membership."""
     lay = cfg["layout"]
     min_ov = lay["text_region_overlap_ratio"]
     tables = [r["bbox"] for r in regions if r["type"] == "table"]
@@ -100,12 +93,14 @@ def reclassify_text_regions(regions: list, cfg: dict) -> None:
     for r in regions:
         if r["type"] not in ("text", "dimension", "annotation"):
             continue
+        r.setdefault("semantic_type", r["type"])
         if any(frac_inside(r["bbox"], b) >= min_ov for b in tables):
             new_type, tag = lay["text_in_table_type"], "in_table"
         elif any(frac_inside(r["bbox"], b) >= min_ov for b in drawings):
-            new_type, tag = lay["text_in_drawing_type"], "in_drawing"
+            new_type, tag = r["semantic_type"], "in_drawing"
         else:
             continue
+        r["spatial_context"] = tag
         if new_type != r["type"]:
             r["type"] = new_type
             r["source"] = f'{r["source"]}+{tag}'

@@ -18,7 +18,7 @@ input/*.{jpg,png,pdf}
   |               and native vector paths are extracted as well)
   +- Preprocess: automatic upscaling of low-resolution pages
   +- Per-page layout analysis
-  |    +- Text detection: EasyOCR (GPU) or PDF native words
+  |    +- Text detection: PDF native words plus supplementary EasyOCR
   |    |    -> words are merged into lines
   |    |    -> rule-based classification: text / dimension / annotation
   |    +- Page-level table detection: long horizontal/vertical ruling
@@ -42,11 +42,11 @@ input/*.{jpg,png,pdf}
   |    |    -> non-tables: drawing / image classification: heuristics
   |    |       (saturation, mid-tone ratio, ink ratio), optionally refined
   |    |       by a VLM (Ollama llava / OpenAI / Gemini)
-  |    +- Geometric reclassification: content rules are unreliable inside
-  |    |    graphics, so text-based regions lying mostly inside a table
-  |    |    become plain "text" and inside a drawing become "annotation"
-  |    |    (numbers included; the source field gets +in_table/+in_drawing)
+    |    +- Semantic types and spatial context are stored separately
+    |         (table text retains its original semantic_type)
   +- Vectorization of drawing regions:
+      native paths -> clip, deduplicate, group -> coverage check
+      -> raster fallback when native coverage is insufficient:
        adaptive binarization -> skeletonize -> pixel-graph tracing
        -> connected segments merged into polylines (closed loops supported)
        -> Douglas-Peucker simplification
@@ -54,17 +54,23 @@ input/*.{jpg,png,pdf}
 ```
 
 All coordinates in the output are **page pixel coordinates**. When a page is
-upscaled, `layout.json` records `scale` and `original_size` so coordinates can
-be mapped back to the original image.
+upscaled, `layout.json` records `scale`, `original_size`, and the forward/inverse
+affine matrices in `coordinate_transform`. PDF source coordinates are PyMuPDF's
+unrotated CropBox-relative points, not raw PDF user-space coordinates.
 
 ## Output structure
 
-Each run deletes and recreates `output/<file_name>/` for the files it
-processes, so no stale results from a previous run survive.
+Outputs use the full filename plus a normalized absolute-path hash. Processing
+runs in a sibling temporary directory; completed results replace the old folder
+with backup-and-rollback protection. Failure reports go to `output/_failures/`.
+Legacy stem-only output folders are preserved and remain readable by the viewer.
+Use one writer per input. Windows directory replacement is not a single atomic
+operation: a forced termination during publication can leave a `.backup-*`
+folder. Restore it manually if the published folder is absent.
 
 ```
-output/<file_name>/
-  result.json                 # file summary (page count, region counts)
+output/<filename.ext>-<path_hash>/
+  result.json                 # input hash, config, versions, page status
   page_001/
     page.png                  # rendered page image
     layout.json               # regions: id, type, bbox [x0,y0,x1,y1], text,
@@ -138,7 +144,7 @@ python main.py -c my_config.json
 On this machine the pipeline runs under the conda environment `venv_lmm`:
 
 ```powershell
-C:\ProgramData\miniconda3\envs\venv_lmm\python.exe main.py
+C:\Users\ktw\.conda\envs\venv_lmm\python.exe main.py
 ```
 
 ## Result viewer (viewer.py)
@@ -179,21 +185,27 @@ styles by editing the configuration only.
 | `preprocess.upscale_target_min_side` | Upscale pages whose shorter side is below this value (px). 0 disables upscaling. |
 | `preprocess.max_scale` | Maximum upscale factor |
 | `pdf.render_dpi` | PDF rendering resolution (default 200) |
-| `pdf.use_native_text` | Use embedded PDF text instead of OCR when available |
+| `pdf.use_native_text` | Include usable embedded PDF words |
+| `pdf.supplement_native_with_ocr` | Default true: supplement native words with OCR. False skips OCR when usable native words exist; use only for known digital PDFs. `min_native_words` is retained for configuration compatibility. |
 | `pdf.use_native_vectors` | Extract embedded PDF vector paths |
 | `ocr.languages`, `ocr.gpu` | EasyOCR languages and GPU switch |
+| `ocr.cpu_fallback` | Default true: use CPU if CUDA is unavailable; false fails preflight |
+| `ocr.rotation_info` | Optional EasyOCR crop rotations, e.g. `[90,180,270]`; no page deskew |
+| `ocr.tile_size`, `ocr.tile_overlap` | Optional tiled OCR in page pixels; defaults 0 (disabled) and 128. More tiles cost more inference time. |
 | `ocr.min_confidence` | Drop OCR results below this confidence |
 | `ocr.line_gap_factor`, `ocr.line_row_factor` | Word-to-line merging: max horizontal gap / vertical center distance as a multiple of the character height |
 | `ocr.short_line_max_tokens`, `ocr.dim_token_ratio` | Line classification: token count treated as a "short line", and the dimension-token fraction above which a long line counts as a dimension |
 | `layout.min_region_area` | Minimum graphic region size (px^2) |
 | `layout.dilate_kernel` | Dilation kernel size used to merge nearby ink into regions |
 | `layout.page_border_margin_px` | Erase ink within this margin of the page edges (drops scan/frame border artifacts) |
-| `layout.text_in_drawing_type`, `layout.text_in_table_type` | Type given to text-based regions inside a drawing (default `annotation`) / inside a table (default `text`) |
+| `layout.text_in_table_type` | Table display type (default `text`); `semantic_type` retains content classification. Drawing types are preserved; `text_in_drawing_type` is a legacy setting. |
 | `layout.text_region_overlap_ratio` | Fraction of a text region's area that must lie inside the graphic bbox to trigger the reclassification |
 | `classify.use_vlm` | Enable VLM-based drawing/image re-classification |
 | `classify.ambiguous_only` | Call the VLM only when the heuristic is uncertain |
 | `classify.provider` | `ollama` / `openai` / `gemini` |
 | `classify.vlm_max_image_side` | Downscale region crops to this size before sending them to the VLM |
+| `classify.max_calls_per_document`, `classify.budget_sec`, `classify.max_failures` | Defaults: 20 calls, 120 seconds of accumulated call time, circuit opens after 2 consecutive failures |
+| `classify.timeout_sec` | Per-request SDK timeout, capped by remaining budget; SDK retries are disabled. Transport timeouts are not a hard process deadline. |
 | `classify.heuristic.*` | All thresholds/weights of the drawing/image heuristic (gray-level bounds `dark_gray_max`/`light_gray_min`, normalizers `sat_photo_norm`/`mid_photo_norm`, weights `sat_weight`/`mid_weight`/`dark_ratio_bonus`, decision point `photo_score_threshold`) |
 | `table.enable` | Enable ruling-line table detection/parsing |
 | `table.min_rows`, `table.min_cols` | Minimum grid size to accept a table |
@@ -209,6 +221,63 @@ styles by editing the configuration only.
 | `table.min_cell_text_ratio` | Fraction of cells that must contain text; mostly-empty lattices (drawing line networks) are rejected. Lower it for form-style tables with many blank cells |
 | `vectorize.simplify_epsilon` | Polyline simplification strength (px) |
 | `vectorize.min_polyline_length_px` | Drop polylines shorter than this (noise filter) |
+| `vectorize.native_curve_tolerance_px` | Native cubic chord-error target, default 0.25px after upscaling |
+| `vectorize.min_native_coverage` | Minimum stroke-ink coverage for native-only output, default 0.9; otherwise raster fallback |
+
+## Validation and operation
+
+```powershell
+python main.py --check
+python -m unittest discover -s tests -v
+python -m pipeline.evaluate reference/layout.json prediction/layout.json --min-region-f1 0.9 --max-cer 0.1
+```
+
+The evaluation thresholds above are examples, not certified document accuracy.
+The core suite needs no OCR weights, GPU, VLM service, or API keys. CI runs this
+suite on Python 3.11. Model inference is a separate integration check.
+
+`pipeline.evaluate` matches regions one-to-one by type and IoU. It reports
+per-type precision/recall/F1, matched IoU, Unicode character error rate (including
+missing/extra regions), exact cell span-and-text scores, and matched vector
+Hausdorff distance/group/closed-path counts. Optional `--min-cell-f1` and
+`--max-vector-error` gates return a nonzero exit code on failure. Compare layouts
+at the same pixel size; do not treat predictions as ground truth.
+
+The output contract is [doc/result.schema.json](doc/result.schema.json).
+Export also checks bbox bounds, unique IDs, cell occupancy, vector coordinates,
+and referenced files. The manifest stores input SHA-256, effective configuration,
+package versions, run ID, warnings and per-page status/timing. Failure records
+may list completed pages from a discarded temporary run; those are diagnostic
+records, not published page links. Older successful results remain untouched.
+
+Confidence values are source-specific scores, not calibrated probabilities:
+native text uses 1.0, OCR uses model scores, tables use grid coverage, and
+heuristics use a separation score. VLM classifications use null (`N/A` in the
+viewer), with model, status and fallback reason recorded separately. OpenAI and
+Gemini receive document crops when enabled. Keep `ambiguous_only=true` and use
+the local heuristic or Ollama when external transmission is inappropriate.
+
+## Supported scope
+
+- Tested geometry: PDF rotations 0/90/180/270, offset CropBox, upscaling and
+  inverse transforms; axis-aligned ruled cells and conservative uncertain merges.
+- Word boxes, not merged line hulls, are masked. Lines inside a word box or its
+  padding can still be erased; there is no speculative line reconstruction.
+- Bare numbers are dimension candidates, not proven measurements. `#3` is an
+  annotation; radius, diameter and tolerance patterns retain their semantics in
+  drawings. Table numbers display as text while preserving `semantic_type`.
+- Optional rotation recognition and tiled OCR retain page coordinates. Full-page
+  orientation correction, deskew and vertical reading-order reconstruction are
+  not implemented. Slanted tables, borderless tables, empty forms and single-row
+  or single-column tables are outside the default supported set.
+- Filled-only PDF paths are excluded from native stroke output. OCR/native word
+  masks remove known character outlines; undetected outlined text can remain.
+  A mixed raster/native region falls back as a whole if coverage is insufficient.
+- Real-document approval remains pending: independently label representative
+  Korean/English/numeric text, regions, merged cells and vectors; separate tuning
+  and evaluation documents. Include rotated scans, vertical dimensions, skewed
+  tables and tiny text as challenge cases, with unsupported cases labeled as such.
+  Set production thresholds only after measuring this held-out set.
 
 ## Technology choices
 

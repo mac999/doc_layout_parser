@@ -14,6 +14,8 @@ import math
 import cv2
 import numpy as np
 from skimage.morphology import skeletonize
+from shapely.geometry import LineString, Polygon, box
+from shapely.ops import unary_union
 
 from .regions import binarize_ink, mask_text
 
@@ -116,17 +118,7 @@ class _UnionFind:
             self.parent[rb] = ra
 
 
-def vectorize_region(page_img: np.ndarray, bbox: list, text_items: list, cfg: dict,
-                     component_mask: np.ndarray = None) -> list:
-    """Vectorize one region and return polylines in page pixel coordinates.
-
-    component_mask: optional bool mask with the same size as the bbox crop.
-    When bounding boxes overlap, it keeps only the pixels of this region's
-    connected component so ink from other regions is not vectorized twice.
-
-    Returns [{id, points:[[x,y],...], closed, length_px, num_points, group}].
-    """
-    v = cfg["vectorize"]
+def _region_ink(page_img, bbox, text_items, cfg, component_mask):
     x0, y0, x1, y1 = [int(round(c)) for c in bbox]
     crop = page_img[y0:y1, x0:x1]
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
@@ -137,12 +129,30 @@ def vectorize_region(page_img: np.ndarray, bbox: list, text_items: list, cfg: di
     # Exclude text inside the region from vectorization
     # (bboxes shifted to region-local coordinates).
     local_texts = []
-    for it in text_items:
+    for it in [word for item in text_items for word in (item.get("words") or [item])]:
         bx0, by0, bx1, by1 = it["bbox"]
         if bx1 <= x0 or bx0 >= x1 or by1 <= y0 or by0 >= y1:
             continue
         local_texts.append({"bbox": [bx0 - x0, by0 - y0, bx1 - x0, by1 - y0]})
-    ink = mask_text(ink, local_texts, cfg["layout"]["text_mask_padding"])
+    return mask_text(ink, local_texts, cfg["layout"]["text_mask_padding"])
+
+
+def native_coverage(page_img, bbox, text_items, cfg, component_mask, polylines) -> float:
+    ink = _region_ink(page_img, bbox, text_items, cfg, component_mask) > 0
+    covered = np.zeros(ink.shape, dtype=np.uint8)
+    origin = np.array([round(bbox[0]), round(bbox[1])])
+    for polyline in polylines:
+        points = np.rint(np.asarray(polyline["points"]) - origin).astype(np.int32)
+        cv2.polylines(covered, [points], polyline["closed"], 255, 5)
+    return float(np.count_nonzero(ink & (covered > 0)) / max(1, np.count_nonzero(ink)))
+
+
+def vectorize_region(page_img: np.ndarray, bbox: list, text_items: list, cfg: dict,
+                     component_mask: np.ndarray = None) -> list:
+    """Trace one component into grouped page-pixel polylines."""
+    v = cfg["vectorize"]
+    x0, y0 = [int(round(value)) for value in bbox[:2]]
+    ink = _region_ink(page_img, bbox, text_items, cfg, component_mask)
 
     skel = skeletonize(ink > 0)
     paths = _trace_paths(skel)
@@ -194,6 +204,76 @@ def vectorize_region(page_img: np.ndarray, bbox: list, text_items: list, cfg: di
             "num_points": len(pts_page),
             "group": group_map[root],
         })
+    return results
+
+
+def native_vectors_for_region(native: list, bbox: list, text_items: list, cfg: dict,
+                              component_mask=None, exclude_bboxes=(), claimed=()) -> list:
+    """Clip native strokes to one component, excluding text, tables and prior owners."""
+    allowed = box(*bbox)
+    if component_mask is not None:
+        contours, hierarchy = cv2.findContours(component_mask.astype(np.uint8),
+                                               cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        polygons = []
+        if hierarchy is not None:
+            for index, contour in enumerate(contours):
+                if hierarchy[0][index][3] != -1 or len(contour) < 3:
+                    continue
+                holes = []
+                child = hierarchy[0][index][2]
+                while child != -1:
+                    if len(contours[child]) >= 3:
+                        holes.append(contours[child][:, 0, :] + np.array(bbox[:2]))
+                    child = hierarchy[0][child][0]
+                polygons.append(Polygon(contour[:, 0, :] + np.array(bbox[:2]), holes).buffer(0))
+        allowed = allowed.intersection(unary_union(polygons))
+    padding = cfg["layout"]["text_mask_padding"]
+    blocked = [box(*bounds) for bounds in exclude_bboxes]
+    blocked.extend(box(*word["bbox"]).buffer(padding, join_style=2)
+                   for item in text_items for word in (item.get("words") or [item]))
+    if blocked:
+        allowed = allowed.difference(unary_union(blocked))
+    previous = unary_union([LineString(polyline["points"]) for polyline in claimed])
+    clipped = []
+    for polyline in native:
+        points = polyline["points"]
+        if len(points) < 2 or not np.isfinite(points).all():
+            continue
+        if polyline.get("closed") and points[0] != points[-1]:
+            points = points + [points[0]]
+        line = LineString(points).intersection(allowed).difference(previous)
+        if not line.is_empty:
+            clipped.append(line)
+    geometry = unary_union(clipped)
+
+    def line_parts(shape):
+        if shape.geom_type == "LineString":
+            yield shape
+        elif hasattr(shape, "geoms"):
+            for part in shape.geoms:
+                yield from line_parts(part)
+
+    results = []
+    union = _UnionFind()
+    endpoints = {}
+    for line in line_parts(geometry):
+        if line.length <= 1e-6:
+            continue
+        points = [list(point) for point in line.coords]
+        index = len(results)
+        union.find(index)
+        for endpoint in (points[0], points[-1]):
+            key = tuple(round(value, 5) for value in endpoint)
+            if key in endpoints:
+                union.union(index, endpoints[key])
+            endpoints[key] = index
+        results.append({"id": index, "points": points, "closed": bool(line.is_ring),
+                        "length_px": float(line.length), "num_points": len(points),
+                        "source": "pdf_native"})
+    groups = {}
+    for index, polyline in enumerate(results):
+        root = union.find(index)
+        polyline["group"] = groups.setdefault(root, len(groups))
     return results
 
 

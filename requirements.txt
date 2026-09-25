@@ -6,6 +6,7 @@ numpy>=2.0
 easyocr>=1.7           # text detection/recognition (GPU, ko+en)
 shapely>=2.1           # optional geometry post-processing
 networkx>=3.0          # optional vector graph analysis
+jsonschema>=4.23       # output contract validation
 
 # Result viewer (viewer.py web app)
 flask>=3.0

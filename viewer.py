@@ -48,13 +48,25 @@ def create_app(out_root: Path) -> Flask:
         items = []
         if out_root.exists():
             for d in sorted(out_root.iterdir()):
+                if d.name.startswith(".") or d.name == "_failures":
+                    continue
                 rj = d / "result.json"
                 if d.is_dir() and rj.exists():
                     try:
-                        items.append({"name": d.name, **read_json(rj)})
+                        result = read_json(rj)
+                        missing = [page["dir"] for page in result.get("pages", [])
+                                   if page.get("dir") and not (d / page["dir"] / "layout.json").is_file()]
+                        items.append({"name": d.name, **result,
+                                      "status": "incomplete" if missing else result.get("status", "legacy")})
                     except (json.JSONDecodeError, OSError):
                         items.append({"name": d.name, "error": "result.json unreadable"})
-        return jsonify({"output_dir": str(out_root), "files": items})
+        failures = []
+        for record in sorted((out_root / "_failures").glob("*.json")):
+            try:
+                failures.append({"record": f"_failures/{record.name}", **read_json(record)})
+            except (json.JSONDecodeError, OSError):
+                failures.append({"record": f"_failures/{record.name}", "error": "Unreadable failure record"})
+        return jsonify({"output_dir": str(out_root), "files": items, "failures": failures})
 
     @app.get("/api/layout/<name>/<page_dir>")
     def api_layout(name: str, page_dir: str):
@@ -296,6 +308,12 @@ async function loadFiles(){
   $("#outdir").textContent = data.output_dir;
   $("#outdir").title = data.output_dir;
   const list = $("#fileList"); list.innerHTML = "";
+  for(const failure of (data.failures || [])){
+    const row = el("div", {class:"fitem", style:"padding:10px;overflow-wrap:anywhere"});
+    row.appendChild(el("a", {href:fileUrl(failure.record), target:"_blank", title:failure.error || "Failed"},
+      `Failed: ${esc(failure.source_file || failure.record)} (${esc(failure.error_type || "error")})`));
+    list.appendChild(row);
+  }
   if(!state.files.length){
     list.appendChild(el("div", {style:"padding:14px;color:var(--fg-dim);font-size:12px"},
       "파싱 결과가 없습니다.<br>먼저 <code>python main.py</code>를 실행하세요."));
@@ -305,9 +323,10 @@ async function loadFiles(){
     const item = el("div", {class:"fitem"});
     const head = el("div", {class:"fhead"},
       `<span class="arrow">▶</span><span class="name" title="${esc(f.source_file||f.name)}">${esc(f.name)}</span>
-       <span class="cnt">${f.num_pages ?? "?"}p</span>`);
+      <span class="cnt">${esc(f.error ? "unreadable" : f.status || "legacy")} / ${f.num_pages ?? "?"}p</span>`);
     const pages = el("div", {class:"pages"});
     for(const p of (f.pages || [])){
+      if(!p.dir || p.status === "failed") continue;
       const total = p.num_regions ?? 0;
       const row = el("div", {class:"pitem", "data-file":f.name, "data-page":p.dir},
         `<span>페이지 ${p.page}</span><span class="rc">${total} 영역</span>`);
@@ -325,7 +344,7 @@ async function loadFiles(){
   // auto-open the first file
   const first = state.files.find(f => f.pages && f.pages.length);
   if(first){
-    list.querySelector(".fitem").classList.add("open");
+    list.querySelector(`.pitem[data-file="${CSS.escape(first.name)}"]`)?.parentElement.parentElement.classList.add("open");
     selectPage(first.name, first.pages[0].dir);
   }
 }
@@ -492,7 +511,7 @@ function renderList(){
       `<span class="dot" style="background:${TYPE_COLORS[r.type]||"#999"}"></span>
        <span class="id">${r.id}</span>
        <span class="snip" title="${esc(snippet(r))}">${esc(snippet(r))}</span>
-       <span class="cf">${Math.round((r.confidence||0)*100)}%</span>`);
+      <span class="cf">${r.confidence == null ? "N/A" : Math.round(r.confidence*100)+"%"}</span>`);
     row.onclick = () => selectRegion(r.id);
     list.appendChild(row);
   }
@@ -543,8 +562,10 @@ async function renderDetail(){
       <button class="smallbtn" onclick="closeDetail()">✕</button></h3>
     <table>
       <tr><td>bbox</td><td>[${x0}, ${y0}] – [${x1}, ${y1}] &nbsp;(${x1-x0}×${y1-y0}px)</td></tr>
-      <tr><td>신뢰도</td><td>${(r.confidence ?? 0).toFixed(3)}</td></tr>
+        <tr><td>신뢰도</td><td>${r.confidence == null ? "N/A" : r.confidence.toFixed(3)} (${esc(r.confidence_kind || "legacy")})</td></tr>
       <tr><td>분류 방법</td><td>${esc(r.source || "-")}</td></tr>`;
+      if(r.vlm) html += `<tr><td>VLM</td><td>${esc(r.vlm.model)}: ${esc(r.vlm.status)} ${esc(r.vlm.reason || "")}</td></tr>`;
+      if(r.spatial_context) html += `<tr><td>Context</td><td>${esc(r.spatial_context)} / ${esc(r.semantic_type)}</td></tr>`;
   if(r.metrics) html += `<tr><td>metrics</td><td>${Object.entries(r.metrics)
       .map(([k,v])=>`${k}=${v}`).join(", ")}</td></tr>`;
   if(r.words?.length) html += `<tr><td>단어 수</td><td>${r.words.length}</td></tr>`;

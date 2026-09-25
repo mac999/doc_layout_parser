@@ -137,7 +137,7 @@ def _merge_spans(nrows: int, ncols: int, merge_right: set, merge_down: set) -> l
     """Union-find cells whose shared border is missing; return span groups.
 
     Returns [{"row", "col", "row_span", "col_span"}] with one entry per
-    merged cell group (rectangular hull of the group).
+    rectangular group; nonrectangular groups remain uncertain unit cells.
     """
     parent = list(range(nrows * ncols))
 
@@ -161,12 +161,21 @@ def _merge_spans(nrows: int, ncols: int, merge_right: set, merge_down: set) -> l
     for i in range(nrows):
         for j in range(ncols):
             r = find(i * ncols + j)
-            g = groups.setdefault(r, [i, j, i, j])
-            g[0] = min(g[0], i); g[1] = min(g[1], j)
-            g[2] = max(g[2], i); g[3] = max(g[3], j)
-    return [{"row": g[0], "col": g[1],
-             "row_span": g[2] - g[0] + 1, "col_span": g[3] - g[1] + 1}
-            for g in sorted(groups.values(), key=lambda g: (g[0], g[1]))]
+            groups.setdefault(r, []).append((i, j))
+    cells = []
+    for members in groups.values():
+        first_row = min(row for row, column in members)
+        last_row = max(row for row, column in members)
+        first_col = min(column for row, column in members)
+        last_col = max(column for row, column in members)
+        row_span, col_span = last_row - first_row + 1, last_col - first_col + 1
+        if len(members) == row_span * col_span:
+            cells.append({"row": first_row, "col": first_col,
+                          "row_span": row_span, "col_span": col_span})
+        else:
+            cells.extend({"row": row, "col": column, "row_span": 1, "col_span": 1,
+                          "merge_uncertain": True} for row, column in members)
+    return sorted(cells, key=lambda cell: (cell["row"], cell["col"]))
 
 
 def _stray_ink_ratio(binary: np.ndarray, horiz: np.ndarray, vert: np.ndarray,

@@ -1,0 +1,12 @@
+name: Regression
+on: [push, pull_request]
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install 'PyMuPDF>=1.26' 'opencv-python-headless>=4.10' 'scikit-image>=0.26' 'numpy>=2.0' 'shapely>=2.1' 'networkx>=3.0' 'jsonschema>=4.23' 'flask>=3.0'
+      - run: python -m unittest discover -s tests -v

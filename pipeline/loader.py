@@ -23,6 +23,7 @@ class PageData:
     native_polylines: list = field(default_factory=list)  # [{points:[[x,y],...], closed:bool}]
     scale: float = 1.0               # upscale factor relative to the original
     original_size: tuple = None      # (width, height) of the original page in pixels
+    coordinate_transform: dict = field(default_factory=dict)
 
 
 def maybe_upscale(page: PageData, cfg: dict) -> PageData:
@@ -41,10 +42,17 @@ def maybe_upscale(page: PageData, cfg: dict) -> PageData:
     scale = min(float(pre.get("max_scale", 3.0)), target / min(h, w))
     page.image = cv2.resize(page.image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
     page.scale = scale
+    scale_x = page.image.shape[1] / w
+    scale_y = page.image.shape[0] / h
     for wd in page.native_words:
-        wd["bbox"] = [round(v * scale, 1) for v in wd["bbox"]]
+        wd["bbox"] = [value * (scale_x if index % 2 == 0 else scale_y)
+                      for index, value in enumerate(wd["bbox"])]
     for pl in page.native_polylines:
-        pl["points"] = [[round(x * scale, 2), round(y * scale, 2)] for x, y in pl["points"]]
+        pl["points"] = [[x * scale_x, y * scale_y] for x, y in pl["points"]]
+    transform = fitz.Matrix(page.coordinate_transform.get("source_to_pixel", [1, 0, 0, 1, 0, 0]))
+    transform = transform * fitz.Matrix(scale_x, scale_y)
+    page.coordinate_transform.update(source_to_pixel=list(transform), pixel_to_source=list(~transform),
+                                     upscale=[scale_x, scale_y])
     return page
 
 
@@ -66,8 +74,12 @@ def imwrite_unicode(path: Path, img: np.ndarray) -> None:
     buf.tofile(str(path))
 
 
-def _bezier_points(p0, p1, p2, p3, n: int):
-    """Sample a cubic Bezier curve into n points."""
+def _bezier_points(p0, p1, p2, p3, n: int, tolerance: float = 0.25):
+    """Sample a cubic with a second-derivative bound on chord error."""
+    control = np.asarray([p0, p1, p2, p3], dtype=float)
+    curvature = 6 * max(np.linalg.norm(control[0] - 2 * control[1] + control[2]),
+                        np.linalg.norm(control[1] - 2 * control[2] + control[3]))
+    n = max(n, 2, int(np.ceil(np.sqrt(curvature / (8 * max(tolerance, 1e-6))))) + 1)
     ts = np.linspace(0.0, 1.0, n)
     pts = []
     for t in ts:
@@ -78,7 +90,8 @@ def _bezier_points(p0, p1, p2, p3, n: int):
     return pts
 
 
-def _extract_native_vectors(page: fitz.Page, zoom: float, bezier_samples: int) -> list:
+def _extract_native_vectors(page: fitz.Page, zoom: float, bezier_samples: int,
+                            transform=None, tolerance: float = 0.25) -> list:
     """Convert PDF vector paths to polylines in page pixel coordinates.
 
     Consecutive line/curve items whose endpoints chain together are merged
@@ -86,6 +99,8 @@ def _extract_native_vectors(page: fitz.Page, zoom: float, bezier_samples: int) -
     """
     polylines = []
     for path in page.get_drawings():
+        if path.get("type") == "f" or path.get("stroke_opacity", 1) == 0:
+            continue
         current: list = []
 
         def flush(closed=False):
@@ -108,7 +123,8 @@ def _extract_native_vectors(page: fitz.Page, zoom: float, bezier_samples: int) -
                     current = [[p1.x, p1.y], [p2.x, p2.y]]
             elif op == "c":  # cubic bezier: control points p1..p4
                 p1, p2, p3, p4 = item[1], item[2], item[3], item[4]
-                pts = _bezier_points((p1.x, p1.y), (p2.x, p2.y), (p3.x, p3.y), (p4.x, p4.y), bezier_samples)
+                pts = _bezier_points((p1.x, p1.y), (p2.x, p2.y), (p3.x, p3.y), (p4.x, p4.y),
+                                     bezier_samples, tolerance / zoom)
                 if current and current[-1] == [p1.x, p1.y]:
                     current.extend(pts[1:])
                 else:
@@ -131,6 +147,11 @@ def _extract_native_vectors(page: fitz.Page, zoom: float, bezier_samples: int) -
                     "closed": True,
                 })
         flush(closed=bool(path.get("closePath")))
+    transform = transform if transform is not None else page.rotation_matrix * fitz.Matrix(zoom, zoom)
+    for polyline in polylines:
+        polyline["points"] = [list(fitz.Point(x / zoom, y / zoom) * transform)
+                              for x, y in polyline["points"]]
+        polyline["source"] = "pdf_native"
     return polylines
 
 
@@ -140,34 +161,40 @@ def load_pages(file_path: Path, cfg: dict):
     pdf_cfg = cfg["pdf"]
 
     if ext == ".pdf":
-        doc = fitz.open(str(file_path))
-        zoom = pdf_cfg["render_dpi"] / 72.0
-        mat = fitz.Matrix(zoom, zoom)
-        for i, page in enumerate(doc):
-            pix = page.get_pixmap(matrix=mat, alpha=False)
-            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-
-            native_words = []
-            if pdf_cfg["use_native_text"]:
-                for w in page.get_text("words"):
-                    x0, y0, x1, y1, text = w[0], w[1], w[2], w[3], w[4]
-                    if not text.strip():
-                        continue
-                    native_words.append({
-                        "bbox": [round(x0 * zoom, 1), round(y0 * zoom, 1),
-                                 round(x1 * zoom, 1), round(y1 * zoom, 1)],
-                        "text": text,
-                        "confidence": 1.0,
-                    })
-
-            native_polylines = []
-            if pdf_cfg["use_native_vectors"]:
-                native_polylines = _extract_native_vectors(page, zoom, cfg["vectorize"]["bezier_samples"])
-
-            yield PageData(i + 1, img, native_words, native_polylines)
-        doc.close()
+        with fitz.open(str(file_path)) as document:
+            for page in document:
+                yield _render_pdf_page(page, cfg)
     elif ext in IMAGE_EXTS:
-        yield PageData(1, imread_unicode(file_path))
+        yield PageData(1, imread_unicode(file_path), coordinate_transform={
+            "source_space": "image_pixel", "source_to_pixel": [1, 0, 0, 1, 0, 0],
+            "pixel_to_source": [1, 0, 0, 1, 0, 0], "upscale": [1.0, 1.0],
+        })
     else:
         raise ValueError(f"Unsupported file format: {file_path}")
+
+
+def _render_pdf_page(page, cfg: dict) -> PageData:
+    pdf_cfg = cfg["pdf"]
+    zoom = pdf_cfg["render_dpi"] / 72.0
+    matrix = fitz.Matrix(zoom, zoom)
+    pixmap = page.get_pixmap(matrix=matrix, alpha=False, colorspace=fitz.csRGB)
+    transform = page.rotation_matrix * matrix * fitz.Matrix(1, 0, 0, 1, -pixmap.x, -pixmap.y)
+    image = np.frombuffer(pixmap.samples, dtype=np.uint8).reshape(pixmap.height, pixmap.width, pixmap.n)
+    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    words = []
+    if pdf_cfg["use_native_text"]:
+        for word in page.get_text("words"):
+            if word[4].strip():
+                words.append({"bbox": list(fitz.Rect(word[:4]) * transform),
+                              "text": word[4], "confidence": 1.0})
+    polylines = []
+    if pdf_cfg["use_native_vectors"]:
+        tolerance = cfg["vectorize"].get("native_curve_tolerance_px", 0.25)
+        tolerance /= max(1.0, cfg.get("preprocess", {}).get("max_scale", 3.0))
+        polylines = _extract_native_vectors(page, zoom, cfg["vectorize"]["bezier_samples"], transform, tolerance)
+    return PageData(page.number + 1, image, words, polylines, coordinate_transform={
+        "source_space": "pymupdf_unrotated_cropbox_points",
+        "source_to_pixel": list(transform), "pixel_to_source": list(~transform),
+        "rotation_degrees": page.rotation, "cropbox": list(page.cropbox),
+        "mediabox": list(page.mediabox), "render_origin": [pixmap.x, pixmap.y],
+        "render_dpi": pdf_cfg["render_dpi"], "upscale": [1.0, 1.0]})

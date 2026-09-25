@@ -1,24 +1,27 @@
 """Text detection with EasyOCR plus text / dimension / annotation classification.
 
-- OCR: EasyOCR (GPU). If a PDF page provides enough native text, the native
-  words are used instead of running OCR.
+- OCR: EasyOCR supplements native PDF text; overlapping duplicates are merged.
 - Classification: regex/heuristic rules distinguish dimensions (numbers,
   diameter/radius marks, tolerances, rebar callouts), annotations (grid
   labels, section marks, title keywords) and plain text.
 """
 import re
+import unicodedata
 
 import numpy as np
 
 _reader = None
+_reader_key = None
 
 
 def get_reader(cfg: dict):
     """Create the EasyOCR reader once and reuse it (model load is expensive)."""
-    global _reader
-    if _reader is None:
+    global _reader, _reader_key
+    key = (tuple(cfg["ocr"]["languages"]), cfg["ocr"]["gpu"])
+    if _reader is None or _reader_key != key:
         import easyocr
         _reader = easyocr.Reader(cfg["ocr"]["languages"], gpu=cfg["ocr"]["gpu"], verbose=False)
+        _reader_key = key
     return _reader
 
 
@@ -34,6 +37,7 @@ def run_ocr(page_img: np.ndarray, cfg: dict) -> list:
         min_size=o.get("min_size", 10),
         text_threshold=o.get("text_threshold", 0.7),
         low_text=o.get("low_text", 0.4),
+        rotation_info=o.get("rotation_info") or None,
     )
     min_conf = cfg["ocr"]["min_confidence"]
     items = []
@@ -142,6 +146,7 @@ def group_into_lines(items: list, gap_factor: float = 1.5, row_factor: float = 0
             "text": " ".join(w["text"] for w in chunk),
             "confidence": round(min(w["confidence"] for w in chunk), 3),
             "words": [{"bbox": w["bbox"], "text": w["text"], "confidence": w["confidence"]}
+                      | {key: w[key] for key in ("source", "native_matches") if key in w}
                       for w in chunk],
         })
     return merged
@@ -163,20 +168,77 @@ def classify_line(line: dict, max_tokens: int = 3, dim_ratio: float = 0.5) -> st
     return "text"
 
 
+def _normalized_text(text: str) -> str:
+    return "".join(unicodedata.normalize("NFKC", text).casefold().split())
+
+
+def _overlap_fraction(first: list, second: list) -> float:
+    overlap = max(0, min(first[2], second[2]) - max(first[0], second[0])) * max(
+        0, min(first[3], second[3]) - max(first[1], second[1]))
+    return overlap / max(1, (first[2] - first[0]) * (first[3] - first[1]))
+
+
+def merge_text_words(native_words: list, ocr_words: list) -> list:
+    """Keep native precision for duplicates and retain OCR-only text."""
+    words = []
+    for incoming in native_words + ocr_words:
+        normalized = _normalized_text(incoming["text"])
+        matches = [word for word in words if max(
+            _overlap_fraction(word["bbox"], incoming["bbox"]),
+            _overlap_fraction(incoming["bbox"], word["bbox"])) >= 0.7]
+        if any(_normalized_text(word["text"]) == normalized for word in matches):
+            continue
+        ordered = sorted(matches, key=lambda word: (word["bbox"][1], word["bbox"][0]))
+        combined = _normalized_text("".join(word["text"] for word in ordered))
+        if combined and (normalized == combined or any(
+                normalized in _normalized_text(word["text"]) and
+                _overlap_fraction(incoming["bbox"], word["bbox"]) >= 0.8 for word in matches)):
+            continue
+        covered = [word for word in matches if _normalized_text(word["text"]) in normalized
+                   and _overlap_fraction(word["bbox"], incoming["bbox"]) >= 0.8]
+        if covered and incoming["source"] == "ocr":
+            native_matches = [word for word in covered if "pdf_native" in word["source"]]
+            incoming = {**incoming, "source": "ocr+pdf_native" if native_matches else "ocr",
+                        "native_matches": native_matches}
+            words = [word for word in words if all(word is not match for match in covered)]
+        words.append(dict(incoming))
+    return words
+
+
+def _ocr_page(image: np.ndarray, cfg: dict) -> list:
+    size = cfg["ocr"].get("tile_size", 0)
+    height, width = image.shape[:2]
+    if size <= 0 or max(height, width) <= size:
+        return run_ocr(image, cfg)
+    overlap = cfg["ocr"].get("tile_overlap", 128)
+    if not 0 <= overlap < size:
+        raise ValueError("ocr.tile_overlap must be between 0 and tile_size - 1")
+    words = []
+    for top in range(0, height, size - overlap):
+        for left in range(0, width, size - overlap):
+            for word in run_ocr(image[top:top + size, left:left + size], cfg):
+                words.append({**word, "bbox": [value + (left if index % 2 == 0 else top)
+                                               for index, value in enumerate(word["bbox"])], "source": "ocr"})
+    return merge_text_words([], words)
+
+
 def get_text_items(page, cfg: dict) -> list:
-    """Extract text from a page (native words preferred, OCR as fallback),
-    merge words into lines, then classify each line."""
-    if page.native_words and len(page.native_words) >= cfg["pdf"]["min_native_words"]:
-        words = [dict(w) for w in page.native_words]
-        source = "pdf_native"
-    else:
-        words = run_ocr(page.image, cfg)
-        source = "ocr"
+    """Merge usable native words with OCR, retaining per-word provenance."""
+    height, width = page.image.shape[:2]
+    native = [{**word, "source": "pdf_native"} for word in page.native_words
+              if word["text"].strip() and "\ufffd" not in word["text"]
+              and all(character.isprintable() for character in word["text"])
+              and 0 <= word["bbox"][0] < word["bbox"][2] <= width
+              and 0 <= word["bbox"][1] < word["bbox"][3] <= height]
+    supplement = cfg["pdf"].get("supplement_native_with_ocr", True)
+    detected = _ocr_page(page.image, cfg) if supplement or not native else []
+    words = merge_text_words(native, [{**word, "source": "ocr"} for word in detected])
     o = cfg["ocr"]
     items = group_into_lines(words, gap_factor=o.get("line_gap_factor", 1.5),
                              row_factor=o.get("line_row_factor", 0.6))
     for it in items:
         it["type"] = classify_line(it, max_tokens=o.get("short_line_max_tokens", 3),
                                    dim_ratio=o.get("dim_token_ratio", 0.5))
-        it["source"] = source
+        it["source"] = "+".join(sorted({source for word in it["words"]
+                          for source in word["source"].split("+")}))
     return items

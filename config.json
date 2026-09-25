@@ -9,11 +9,13 @@
     "render_dpi": 200,
     "use_native_text": true,
     "use_native_vectors": true,
-    "min_native_words": 5
+    "min_native_words": 5,
+    "supplement_native_with_ocr": true
   },
   "ocr": {
     "languages": ["ko", "en"],
     "gpu": true,
+    "cpu_fallback": true,
     "min_confidence": 0.30,
     "paragraph": false,
     "mag_ratio": 1.0,
@@ -24,7 +26,10 @@
     "line_gap_factor": 1.5,
     "line_row_factor": 0.6,
     "short_line_max_tokens": 3,
-    "dim_token_ratio": 0.5
+    "dim_token_ratio": 0.5,
+    "rotation_info": [],
+    "tile_size": 0,
+    "tile_overlap": 128
   },
   "layout": {
     "min_region_area": 3000,
@@ -46,6 +51,9 @@
     "gemini_model": "gemini-2.0-flash",
     "timeout_sec": 60,
     "vlm_max_image_side": 768,
+    "max_calls_per_document": 20,
+    "budget_sec": 120,
+    "max_failures": 2,
     "heuristic": {
       "dark_gray_max": 60,
       "light_gray_min": 200,
@@ -85,7 +93,9 @@
     "binarize_C": 11,
     "min_polyline_length_px": 8.0,
     "simplify_epsilon": 2.0,
-    "bezier_samples": 8
+    "bezier_samples": 8,
+    "native_curve_tolerance_px": 0.25,
+    "min_native_coverage": 0.9
   },
   "export": {
     "save_page_image": true,
