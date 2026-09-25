@@ -63,10 +63,8 @@ input/*.{jpg,png,pdf}
        -> polylines sharing endpoints get the same connectivity group id
 ```
 
-All coordinates in the output are **page pixel coordinates**. When a page is
-upscaled, `layout.json` records `scale`, `original_size`, and the forward/inverse
-affine matrices in `coordinate_transform`. PDF source coordinates are PyMuPDF's
-unrotated CropBox-relative points, not raw PDF user-space coordinates.
+All output coordinates use **page pixels**. See [JSON format](#json-format)
+for coordinate transforms, field definitions and examples.
 
 ## Output structure
 
@@ -98,14 +96,145 @@ output/<filename.ext>-<path_hash>/
     native_vectors.json       # native vector paths (vector PDFs only)
 ```
 
+### JSON format
+
+PDF and image inputs use the same output contract. JSON is UTF-8, pretty-printed
+with two-space indentation; OCR text retains its original language.
+
+| Input | Output |
+|---|---|
+| `scan.png` / `scan.jpg` | One `result.json` and one `page_001/layout.json` |
+| Two-page `drawing.pdf` | One `result.json`, plus `page_001/layout.json` and `page_002/layout.json` |
+| Scanned PDF | Rendered pages use OCR; JSON structure is unchanged |
+| Digital PDF | Native text and available vector strokes can be retained, supplemented by OCR/raster processing |
+
+**Document summary: `result.json`**
+
+This abbreviated two-page PDF example shows how to locate page results. Actual
+manifests also contain the input path/SHA-256, run ID, start time, effective config,
+package versions, warnings, VLM usage and per-page size, transforms and timing.
+
+```json
+{
+  "schema_version": "1.0",
+  "source_file": "drawing.pdf",
+  "status": "complete",
+  "num_pages": 2,
+  "pages": [
+    {"page": 1, "status": "complete", "dir": "page_001", "num_regions": 1, "region_counts": {"text": 1}},
+    {"page": 2, "status": "complete", "dir": "page_002", "num_regions": 2, "region_counts": {"table": 1, "drawing": 1}}
+  ]
+}
+```
+
+**Page layout: `page_001/layout.json`**
+
+An illustrative, unscaled 1000 x 1400 image with one OCR text region:
+
+```json
+{
+  "schema_version": "1.0",
+  "status": "complete",
+  "page": 1,
+  "size": {"width": 1000, "height": 1400},
+  "original_size": {"width": 1000, "height": 1400},
+  "scale": 1.0,
+  "coordinate_transform": {
+    "source_space": "image_pixel",
+    "source_to_pixel": [1, 0, 0, 1, 0, 0],
+    "pixel_to_source": [1, 0, 0, 1, 0, 0]
+  },
+  "num_regions": 1,
+  "regions": [
+    {
+      "id": "r001",
+      "type": "text",
+      "bbox": [100, 80, 320, 110],
+      "text": "FLOOR PLAN",
+      "confidence": 0.97,
+      "confidence_kind": "ocr_score",
+      "source": "ocr",
+      "words": [
+        {"text": "FLOOR", "bbox": [100, 80, 210, 110], "confidence": 0.98, "source": "ocr"},
+        {"text": "PLAN", "bbox": [220, 80, 320, 110], "confidence": 0.97, "source": "ocr"}
+      ]
+    }
+  ],
+  "warnings": []
+}
+```
+
+| Region type | Main payload / artifact fields |
+|---|---|
+| `text`, `dimension`, `annotation` | `text`, `words`, `confidence`, `source`; optional `semantic_type` and `spatial_context` |
+| `table` | Inline `table` object with rows, columns and cells; `table_file` points to the same structure with region metadata |
+| `drawing` | `num_polylines`, `vector_file`, optional `svg_file`; `vector_source` identifies the native/raster route |
+| `image` | `image_file` points to the extracted raster crop |
+
+Crop-enabled exports also add `image_file` to table/drawing regions. Artifact
+fields are conditional on detected content and export settings; do not assume
+every region has an image or vector file.
+
+**Table data: `tables/r002.json`**
+
+Illustrative cell-data excerpt: a two-column header merged across both columns.
+The corresponding region has `table_file: "tables/r002.json"` and an inline `table` object.
+
+```json
+{
+  "region_id": "r002",
+  "bbox": [100, 200, 500, 300],
+  "coordinate_system": "page_pixel",
+  "rows": 2,
+  "cols": 2,
+  "num_cells": 3,
+  "cells": [
+    {"row": 0, "col": 0, "row_span": 1, "col_span": 2, "bbox": [100, 200, 500, 250], "text": "Schedule"},
+    {"row": 1, "col": 0, "row_span": 1, "col_span": 1, "bbox": [100, 250, 300, 300], "text": "Width"},
+    {"row": 1, "col": 1, "row_span": 1, "col_span": 1, "bbox": [300, 250, 500, 300], "text": "1200"}
+  ]
+}
+```
+
+**Vector data: `vectors/r003.json`**
+
+The drawing region references this file through `vector_file: "vectors/r003.json"`.
+
+```json
+{
+  "region_id": "r003",
+  "bbox": [100, 400, 300, 600],
+  "coordinate_system": "page_pixel",
+  "num_polylines": 1,
+  "num_groups": 1,
+  "polylines": [
+    {"points": [[110, 410], [290, 410], [290, 590]], "closed": false, "length_px": 360.0, "num_points": 3, "group": 0}
+  ]
+}
+```
+
+- Page numbers start at 1; table `row` / `col` indices start at 0. Region IDs are page-local.
+- All bboxes are `[left, top, right, bottom]` in final page pixels, with origin at the top left.
+  Table cells and vector points use page coordinates, not crop-local coordinates.
+- `pages[].dir` is relative to the document output directory; region artifact paths are relative to the page directory.
+- `coordinate_transform` stores forward/inverse affine matrices in `source_to_pixel`
+  and `pixel_to_source`; `scale` records the raster upscaling factor.
+- For PDFs, `source_space` is `pymupdf_unrotated_cropbox_points`. Use `pixel_to_source`
+  to map results back to unrotated CropBox-relative points, not raw PDF user space.
+  `original_size` is the pre-upscale raster size, not PDF point dimensions.
+- `confidence` is source-specific, not a calibrated probability: native text uses
+  1.0, OCR uses model scores, tables use grid coverage, and heuristics use a separation
+  score. Interpret it with `confidence_kind` and `source`. VLM classifications use
+  `null` (`N/A` in the viewer), with model, status and fallback reason recorded separately.
+- The versioned [JSON Schema](doc/result.schema.json) defines the document/page contract.
+  The manifest and table examples above are excerpts, not complete production records.
+
 ## Installation
 
 Prerequisites:
 
 - Windows / Linux, Python 3.10+
 - NVIDIA GPU recommended (8 GB VRAM is enough); CPU also works
-- [Ollama](https://ollama.com) with a vision model — **used by the default
-  `config.json`** (`classify.provider: "ollama"`): `ollama pull llava`
 
 ```powershell
 # Create an environment (conda example)
@@ -121,24 +250,19 @@ Notes:
 - EasyOCR downloads its detection/recognition models (about 120 MB) on first run.
 - PyTorch with CUDA is required for GPU OCR; see https://pytorch.org for the
   wheel matching your CUDA version.
+- The default VLM provider is [Ollama](https://ollama.com). Run `ollama pull llava`
+  and start Ollama to enable it. VLM calls are limited to ambiguous drawing/image
+  classifications by default (`classify.ambiguous_only: true`). If unavailable,
+  the pipeline logs a warning and keeps the heuristic result. To skip VLM calls,
+  set `classify.use_vlm: false` in `config.json`.
 - Commercial VLM providers are optional. Set the API key via environment
-  variables: `OPENAI_API_KEY` or `GOOGLE_API_KEY`.
+  variables: `OPENAI_API_KEY` or `GOOGLE_API_KEY`. OpenAI and Gemini receive document
+  crops when enabled. Keep `ambiguous_only=true` and use local heuristics or Ollama
+  when external transmission is inappropriate.
 
 ## CLI usage
 
-Before running (with the default `config.json`):
-
-1. **Ollama must be running** with the `llava` model pulled
-   (`ollama pull llava`, then make sure the Ollama service/tray app is up).
-   The VLM is only called for regions where the heuristic drawing/image
-   classification is uncertain (`classify.ambiguous_only: true`). If Ollama is
-   not reachable, the pipeline **does not fail** — it logs a warning per call
-   and keeps the heuristic result. To skip the VLM entirely, set
-   `classify.use_vlm: false` in `config.json`.
-2. No other external service is required. ComfyUI is **not** used by this
-   project. EasyOCR runs in-process (first run downloads its models, ~120 MB).
-3. Only when switching `classify.provider` to `openai` / `gemini`: set the
-   `OPENAI_API_KEY` / `GOOGLE_API_KEY` environment variable.
+Complete [Installation](#installation) before running these commands.
 
 ```powershell
 # Process every supported file in the input folder (config.json: input_dir)
@@ -220,7 +344,8 @@ python viewer.py -o output --host 0.0.0.0 --port 8000 --no-browser
 authentication and exposes files under the selected output directory. Its built-in
 Flask server is for development; production hosting requires a WSGI server using
 `viewer.create_app(Path(...))`, with authentication and TLS at a reverse proxy.
-CLI support does not provide a parsing HTTP API or job queue. Keep one parser writer per input.
+CLI support does not provide a parsing HTTP API or job queue. See
+[Output structure](#output-structure) for publication and concurrent-run limits.
 
 ### Demo recording
 
@@ -307,19 +432,10 @@ Hausdorff distance/group/closed-path counts. Optional `--min-cell-f1` and
 `--max-vector-error` gates return a nonzero exit code on failure. Compare layouts
 at the same pixel size; do not treat predictions as ground truth.
 
-The output contract is [doc/result.schema.json](doc/result.schema.json).
-Export also checks bbox bounds, unique IDs, cell occupancy, vector coordinates,
-and referenced files. The manifest stores input SHA-256, effective configuration,
-package versions, run ID, warnings and per-page status/timing. Failure records
+Exports validate the [JSON contract](#json-format) plus bbox bounds, unique IDs,
+cell occupancy, vector coordinates and referenced files. Failure records
 may list completed pages from a discarded temporary run; those are diagnostic
-records, not published page links. Older successful results remain untouched.
-
-Confidence values are source-specific scores, not calibrated probabilities:
-native text uses 1.0, OCR uses model scores, tables use grid coverage, and
-heuristics use a separation score. VLM classifications use null (`N/A` in the
-viewer), with model, status and fallback reason recorded separately. OpenAI and
-Gemini receive document crops when enabled. Keep `ambiguous_only=true` and use
-the local heuristic or Ollama when external transmission is inappropriate.
+records, not published page links.
 
 ## Supported scope
 
