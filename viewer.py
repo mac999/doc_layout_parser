@@ -129,6 +129,8 @@ body.resizing iframe, body.resizing img, body.resizing-v img{pointer-events:none
 #side{background:var(--panel); border-right:1px solid var(--border); display:flex; flex-direction:column; min-width:0}
 #side h1{font-size:14px; font-weight:600; padding:14px 16px 4px; letter-spacing:.2px}
 #side h1 span{color:var(--accent)}
+.language-switch{display:flex; gap:4px; margin:4px 16px 8px; align-self:flex-start}
+.language-switch button{min-width:64px}
 #side .sub{padding:0 16px 10px; color:var(--fg-dim); font-size:11px; border-bottom:1px solid var(--border);
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
 #fileList{overflow-y:auto; flex:1; padding:8px}
@@ -190,10 +192,13 @@ body.resizing iframe, body.resizing img, body.resizing-v img{pointer-events:none
 #dhead{padding:10px 14px; border-bottom:1px solid var(--border); font-weight:600; font-size:13px;
   display:flex; align-items:center; gap:8px}
 #dhead .n{margin-left:auto; font-weight:400; color:var(--fg-dim); font-size:11px}
+#selection{font:600 11px Consolas,monospace; color:var(--accent); white-space:nowrap}
 #rlist{overflow-y:auto; flex:1; min-height:60px; padding:6px}
 .rrow{display:flex; align-items:center; gap:8px; padding:6px 8px; border-radius:8px; cursor:pointer; font-size:12px}
 .rrow:hover{background:var(--panel2)}
-.rrow.sel{background:var(--accent-dim)}
+.rrow.sel{background:var(--accent-dim); box-shadow:inset 3px 0 var(--accent); outline:1px solid var(--accent); outline-offset:-1px}
+.rrow.sel .id,.rrow.sel .snip{color:var(--fg); font-weight:600}
+.rrow:focus-visible{outline:2px solid var(--accent); outline-offset:-2px}
 .rrow .dot{width:9px; height:9px; border-radius:3px; flex:none}
 .rrow .id{font-family:Consolas,monospace; color:var(--fg-dim); flex:none}
 .rrow .snip{flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--fg-dim)}
@@ -203,6 +208,9 @@ body.resizing iframe, body.resizing img, body.resizing-v img{pointer-events:none
 #detail.has-detail #splitD{display:block}
 #rdetail .inner{padding:12px 14px 16px}
 #rdetail h3{font-size:13px; display:flex; align-items:center; gap:8px; margin-bottom:8px}
+#rdetail h3{flex-wrap:wrap}
+#rdetail td{overflow-wrap:anywhere}
+#typeChips{flex-wrap:wrap}
 #rdetail h3 .badge{font-size:10.5px; padding:2px 8px; border-radius:999px; color:#fff; font-weight:600}
 #rdetail h3 .zoombtn{margin-left:auto}
 #rdetail table{width:100%; border-collapse:collapse; font-size:11.5px; margin-bottom:10px}
@@ -226,12 +234,28 @@ body.resizing iframe, body.resizing img, body.resizing-v img{pointer-events:none
 ::-webkit-scrollbar{width:10px; height:10px}
 ::-webkit-scrollbar-thumb{background:#2a3040; border-radius:5px; border:2px solid var(--panel)}
 ::-webkit-scrollbar-track{background:transparent}
+@media(max-width:800px){
+  body{overflow:auto}
+  #app{grid-template-columns:minmax(0,1fr); grid-template-rows:130px minmax(300px,1fr) 300px;
+    height:100dvh; min-height:760px}
+  .vsplit{display:none}
+  #side,#detail{min-height:0}
+  #side h1{padding-top:6px}
+  #side .sub{display:none}
+  .language-switch{margin-bottom:2px}
+  #toolbar{gap:5px; padding:6px}
+  #crumb{flex-basis:100%}
+}
 </style>
 </head>
 <body>
 <div id="app">
   <aside id="side">
     <h1>Doc Layout Parser <span>Viewer</span></h1>
+    <div class="tgroup language-switch" role="group" aria-label="Language">
+      <button class="tbtn" data-lang="ko" lang="ko">한국어</button>
+      <button class="tbtn" data-lang="en" lang="en">English</button>
+    </div>
     <div class="sub" id="outdir"></div>
     <div id="fileList"></div>
   </aside>
@@ -269,8 +293,8 @@ body.resizing iframe, body.resizing img, body.resizing-v img{pointer-events:none
   <div class="vsplit" id="splitR" title="드래그로 크기 조절, 더블클릭으로 초기화"></div>
 
   <aside id="detail">
-    <div id="dhead">레이아웃 영역 <span class="n" id="rcount"></span></div>
-    <div id="rlist"></div>
+    <div id="dhead"><span id="regionHeading">레이아웃 영역</span><span id="selection" aria-live="polite"></span><span class="n" id="rcount"></span></div>
+    <div id="rlist" role="listbox" aria-label="레이아웃 영역"></div>
     <div class="hsplit" id="splitD" title="드래그로 크기 조절, 더블클릭으로 초기화"></div>
     <div id="rdetail"><div class="inner" id="rdetailInner"></div></div>
   </aside>
@@ -280,6 +304,31 @@ body.resizing iframe, body.resizing img, body.resizing-v img{pointer-events:none
 "use strict";
 const TYPE_COLORS = {text:"#3b9dff", dimension:"#ff5252", annotation:"#ffa726", drawing:"#2ecc71", image:"#d05ce3", table:"#e0c341"};
 const TYPE_LABELS = {text:"텍스트", dimension:"치수", annotation:"주석", drawing:"도면", image:"이미지", table:"표"};
+const EN = {
+  "텍스트":"Text", "치수":"Dimension", "주석":"Annotation", "도면":"Drawing", "이미지":"Image", "표":"Table",
+  "레이아웃 영역":"Layout Regions", "파일을 선택하세요":"Select a file", "원본":"Original", "오버레이":"Overlay",
+  "영역 박스":"Boxes", "벡터":"Vectors", "PDF 벡터":"PDF Vectors", "맞춤":"Fit", "화면 맞춤":"Fit to canvas",
+  "드래그로 크기 조절, 더블클릭으로 초기화":"Drag to resize; double-click to reset",
+  "선택 {id}":"Selected {id}", "파싱 결과가 없습니다.":"No parsed results.", "페이지 {number}":"Page {number}",
+  "{count} 영역":"{count} regions", "폴리라인 {count}개":"{count} polylines", "래스터 이미지":"Raster image",
+  "표 {rows}행×{cols}열":"Table {rows} × {cols}", "표 구조":"Table structure", "영역으로 확대":"Zoom to region",
+  "닫기":"Close", "점수":"Score", "분류 방법":"Classification", "단어 수":"Words", "폴리라인":"Polylines",
+  "{rows}행 × {cols}열, 셀 {cells}개":"{rows} rows × {cols} columns, {cells} cells",
+  "SVG 열기":"Open SVG", "영역 이미지":"Region image", "벡터 로딩 중…":"Loading vectors…",
+  "폴리라인 {count}개 · 연결그룹 {groups}개":"{count} polylines · {groups} connected groups",
+  "벡터 로드 실패: {error}":"Vector load failed: {error}", "로드 실패: {error}":"Load failed: {error}",
+  "실패":"Failed", "완료":"Complete", "불완전":"Incomplete", "이전 형식":"Legacy", "읽기 오류":"Unreadable",
+  "처리 중":"Running", "소속 / 의미":"Context / meaning", "표 내부":"In table", "도면 내부":"In drawing",
+  "지표":"Metrics", "성공":"OK", "생략":"Skipped"
+};
+const STATUS_LABELS = {failed:"실패", complete:"완료", incomplete:"불완전", legacy:"이전 형식", unreadable:"읽기 오류",
+  running:"처리 중", ok:"성공", skipped:"생략", in_table:"표 내부", in_drawing:"도면 내부"};
+let language = "ko";
+try{ if(localStorage.getItem("viewerLanguage") === "en") language = "en"; }catch(error){}
+function tr(text, values={}){
+  return (language === "en" ? EN[text] || text : text).replace(/\{(\w+)\}/g, (_, key) => values[key] ?? "");
+}
+function statusLabel(value){ return tr(STATUS_LABELS[value] || value); }
 const GROUP_PALETTE = ["#2ecc71","#3b9dff","#ff8f3d","#d05ce3","#00c2c7","#ffd23b","#ff5252","#9fd63b",
                        "#7a7cff","#ff7ab8","#5bd0ff","#c0a06a"];
 const $ = s => document.querySelector(s);
@@ -296,7 +345,35 @@ const state = {
   types: {text:true, dimension:true, annotation:true, drawing:true, image:true, table:true},
   view: {x:0, y:0, k:1},
   vecCache: {}, nativeCache: {}, detailTab: "crop",
+  fileData: null,
 };
+
+function updateSelectionLabel(){
+  $("#selection").textContent = state.selId ? tr("선택 {id}", {id:state.selId}) : "";
+}
+function setLanguage(value){
+  if(value !== "ko" && value !== "en") return;
+  language = value;
+  try{ localStorage.setItem("viewerLanguage", value); }catch(error){}
+  document.documentElement.lang = value;
+  document.querySelectorAll("[data-lang]").forEach(button => {
+    button.classList.toggle("on", button.dataset.lang === value);
+    button.setAttribute("aria-pressed", String(button.dataset.lang === value));
+  });
+  for(const [selector,text] of Object.entries({
+    '#regionHeading':"레이아웃 영역",'[data-base="page"]':"원본",'[data-base="overlay"]':"오버레이",
+    '#lyBbox':"영역 박스",'#lyVec':"벡터",'#lyNative':"PDF 벡터",'#zoomFit':"맞춤"
+  })) $(selector).textContent = tr(text);
+  $("#zoomFit").title = tr("화면 맞춤");
+  $("#rlist").setAttribute("aria-label", tr("레이아웃 영역"));
+  $("#empty").textContent = tr("파일을 선택하세요");
+  document.querySelectorAll(".vsplit,.hsplit").forEach(node => node.title = tr("드래그로 크기 조절, 더블클릭으로 초기화"));
+  if(!state.layout) $("#crumb").textContent = tr("파일을 선택하세요");
+  if(state.fileData) renderFiles();
+  buildTypeChips(); renderRegions(); renderList(); updateSelectionLabel();
+  if(state.selId && $("#rdetail").classList.contains("show")) selectRegion(state.selId);
+}
+document.querySelectorAll("[data-lang]").forEach(button => button.onclick = () => setLanguage(button.dataset.lang));
 
 async function jget(url){ const r = await fetch(url); if(!r.ok) throw new Error(url+" -> "+r.status); return r.json(); }
 const fileUrl = rel => "/files/" + rel.split("/").map(enc).join("/");
@@ -305,31 +382,37 @@ const fileUrl = rel => "/files/" + rel.split("/").map(enc).join("/");
 async function loadFiles(){
   const data = await jget("/api/files");
   state.files = data.files;
+  state.fileData = data;
+  renderFiles();
+}
+function renderFiles(){
+  const data = state.fileData;
+  const openFiles = new Set([...document.querySelectorAll(".fitem.open[data-file]")].map(item => item.dataset.file));
   $("#outdir").textContent = data.output_dir;
   $("#outdir").title = data.output_dir;
   const list = $("#fileList"); list.innerHTML = "";
   for(const failure of (data.failures || [])){
     const row = el("div", {class:"fitem", style:"padding:10px;overflow-wrap:anywhere"});
-    row.appendChild(el("a", {href:fileUrl(failure.record), target:"_blank", title:failure.error || "Failed"},
-      `Failed: ${esc(failure.source_file || failure.record)} (${esc(failure.error_type || "error")})`));
+    row.appendChild(el("a", {href:fileUrl(failure.record), target:"_blank", title:failure.error || tr("실패")},
+      `${tr("실패")}: ${esc(failure.source_file || failure.record)} (${esc(failure.error_type || "error")})`));
     list.appendChild(row);
   }
   if(!state.files.length){
     list.appendChild(el("div", {style:"padding:14px;color:var(--fg-dim);font-size:12px"},
-      "파싱 결과가 없습니다.<br>먼저 <code>python main.py</code>를 실행하세요."));
+      tr("파싱 결과가 없습니다.")));
     return;
   }
   for(const f of state.files){
-    const item = el("div", {class:"fitem"});
+    const item = el("div", {class:"fitem" + (openFiles.has(f.name) || state.file === f.name ? " open" : ""), "data-file":f.name});
     const head = el("div", {class:"fhead"},
       `<span class="arrow">▶</span><span class="name" title="${esc(f.source_file||f.name)}">${esc(f.name)}</span>
-      <span class="cnt">${esc(f.error ? "unreadable" : f.status || "legacy")} / ${f.num_pages ?? "?"}p</span>`);
+      <span class="cnt">${esc(statusLabel(f.error ? "unreadable" : f.status || "legacy"))} / ${f.num_pages ?? "?"}p</span>`);
     const pages = el("div", {class:"pages"});
     for(const p of (f.pages || [])){
       if(!p.dir || p.status === "failed") continue;
       const total = p.num_regions ?? 0;
-      const row = el("div", {class:"pitem", "data-file":f.name, "data-page":p.dir},
-        `<span>페이지 ${p.page}</span><span class="rc">${total} 영역</span>`);
+      const row = el("div", {class:"pitem" + (state.file === f.name && state.page === p.dir ? " sel" : ""), "data-file":f.name, "data-page":p.dir},
+        `<span>${tr("페이지 {number}", {number:p.page})}</span><span class="rc">${tr("{count} 영역", {count:total})}</span>`);
       row.onclick = () => selectPage(f.name, p.dir);
       pages.appendChild(row);
     }
@@ -343,7 +426,7 @@ async function loadFiles(){
   }
   // auto-open the first file
   const first = state.files.find(f => f.pages && f.pages.length);
-  if(first){
+  if(first && !state.file){
     list.querySelector(`.pitem[data-file="${CSS.escape(first.name)}"]`)?.parentElement.parentElement.classList.add("open");
     selectPage(first.name, first.pages[0].dir);
   }
@@ -352,6 +435,7 @@ async function loadFiles(){
 /* ---------------- page load ---------------- */
 async function selectPage(file, pageDir){
   state.file = file; state.page = pageDir; state.selId = null;
+  updateSelectionLabel();
   state.vecCache = {}; state.nativeCache = {};
   document.querySelectorAll(".pitem").forEach(x =>
     x.classList.toggle("sel", x.dataset.file===file && x.dataset.page===pageDir));
@@ -413,7 +497,7 @@ function renderRegions(){
                                    stroke:color, "vector-effect":"non-scaling-stroke"}));
     }
     const t = svgEl("text", {x:x0+3, y:Math.max(14, y0-5), fill:color});
-    t.textContent = `${r.id} ${r.type}`;
+    t.textContent = `${r.id} ${tr(TYPE_LABELS[r.type] || r.type)}`;
     g.appendChild(t);
     g.addEventListener("click", ev => { ev.stopPropagation(); selectRegion(r.id); });
     layer.appendChild(g);
@@ -473,7 +557,7 @@ function buildTypeChips(){
   for(const t of Object.keys(TYPE_COLORS)){
     if(!(t in counts)) continue;
     const chip = el("span", {class:"chip" + (state.types[t] ? " on" : "")},
-      `<span class="dot" style="background:${TYPE_COLORS[t]}"></span>${TYPE_LABELS[t]} ${counts[t]}`);
+      `<span class="dot" style="background:${TYPE_COLORS[t]}"></span>${tr(TYPE_LABELS[t])} ${counts[t]}`);
     chip.onclick = () => { state.types[t] = !state.types[t]; buildTypeChips(); renderRegions(); renderList(); };
     box.appendChild(chip);
   }
@@ -497,9 +581,9 @@ document.querySelectorAll("#baseGroup .tbtn").forEach(b => b.onclick = () => set
 /* ---------------- region list ---------------- */
 function snippet(r){
   if(r.text) return r.text;
-  if(r.type === "drawing") return `폴리라인 ${r.num_polylines ?? 0}개`;
-  if(r.type === "image") return "래스터 이미지";
-  if(r.type === "table" && r.table) return `표 ${r.table.rows}행×${r.table.cols}열`;
+  if(r.type === "drawing") return tr("폴리라인 {count}개", {count:r.num_polylines ?? 0});
+  if(r.type === "image") return tr("래스터 이미지");
+  if(r.type === "table" && r.table) return tr("표 {rows}행×{cols}열", r.table);
   return "";
 }
 function renderList(){
@@ -507,12 +591,14 @@ function renderList(){
   const regions = (state.layout?.regions || []).filter(r => state.types[r.type]);
   $("#rcount").textContent = state.layout ? `${regions.length}/${state.layout.num_regions}` : "";
   for(const r of regions){
-    const row = el("div", {class:"rrow" + (r.id===state.selId ? " sel":""), "data-id":r.id},
+    const row = el("div", {class:"rrow" + (r.id===state.selId ? " sel":""), "data-id":r.id,
+      role:"option", "aria-selected":String(r.id===state.selId), tabindex:"0"},
       `<span class="dot" style="background:${TYPE_COLORS[r.type]||"#999"}"></span>
        <span class="id">${r.id}</span>
        <span class="snip" title="${esc(snippet(r))}">${esc(snippet(r))}</span>
       <span class="cf">${r.confidence == null ? "N/A" : Math.round(r.confidence*100)+"%"}</span>`);
     row.onclick = () => selectRegion(r.id);
+    row.onkeydown = event => { if(event.key === "Enter" || event.key === " "){ event.preventDefault(); selectRegion(r.id); } };
     list.appendChild(row);
   }
 }
@@ -535,16 +621,23 @@ function cellGridHtml(t){
     }
     html += "</tr>";
   }
-  return html + `</table></div><div class="cap">파싱된 표 구조 (병합 셀 반영)</div>`;
+  return html + `</table></div><div class="cap">${tr("표 구조")}</div>`;
 }
 
 function selectRegion(id){
   state.selId = id;
+  updateSelectionLabel();
   document.querySelectorAll("#rgnLayer .rgn").forEach(g => g.classList.toggle("sel", g.dataset.id===id));
-  document.querySelectorAll("#rlist .rrow").forEach(x => x.classList.toggle("sel", x.dataset.id===id));
-  const row = document.querySelector(`#rlist .rrow[data-id="${id}"]`);
-  if(row) row.scrollIntoView({block:"nearest"});
+  document.querySelectorAll("#rlist .rrow").forEach(row => {
+    const selected = row.dataset.id === id;
+    row.classList.toggle("sel", selected);
+    row.setAttribute("aria-selected", String(selected));
+  });
   renderDetail();
+  requestAnimationFrame(() => {
+    const row = document.querySelector(`#rlist .rrow[data-id="${CSS.escape(state.selId)}"]`);
+    if(row) row.scrollIntoView({block:"nearest", inline:"nearest"});
+  });
 }
 function closeDetail(){ $("#rdetail").classList.remove("show"); $("#detail").classList.remove("has-detail"); }
 
@@ -556,21 +649,21 @@ async function renderDetail(){
   $("#detail").classList.add("has-detail");
   const color = TYPE_COLORS[r.type] || "#999";
   const [x0,y0,x1,y1] = r.bbox.map(v => Math.round(v));
-  let html = `<h3><span class="badge" style="background:${color}">${TYPE_LABELS[r.type]||r.type}</span>
+  let html = `<h3><span class="badge" style="background:${color}">${tr(TYPE_LABELS[r.type]||r.type)}</span>
       <span>${r.id}</span>
-      <button class="smallbtn zoombtn" onclick="zoomToRegion('${r.id}')">영역으로 확대</button>
-      <button class="smallbtn" onclick="closeDetail()">✕</button></h3>
+      <button class="smallbtn zoombtn" onclick="zoomToRegion('${r.id}')">${tr("영역으로 확대")}</button>
+      <button class="smallbtn" onclick="closeDetail()" title="${tr("닫기")}" aria-label="${tr("닫기")}">✕</button></h3>
     <table>
       <tr><td>bbox</td><td>[${x0}, ${y0}] – [${x1}, ${y1}] &nbsp;(${x1-x0}×${y1-y0}px)</td></tr>
-        <tr><td>신뢰도</td><td>${r.confidence == null ? "N/A" : r.confidence.toFixed(3)} (${esc(r.confidence_kind || "legacy")})</td></tr>
-      <tr><td>분류 방법</td><td>${esc(r.source || "-")}</td></tr>`;
-      if(r.vlm) html += `<tr><td>VLM</td><td>${esc(r.vlm.model)}: ${esc(r.vlm.status)} ${esc(r.vlm.reason || "")}</td></tr>`;
-      if(r.spatial_context) html += `<tr><td>Context</td><td>${esc(r.spatial_context)} / ${esc(r.semantic_type)}</td></tr>`;
-  if(r.metrics) html += `<tr><td>metrics</td><td>${Object.entries(r.metrics)
+        <tr><td>${tr("점수")}</td><td>${r.confidence == null ? "N/A" : r.confidence.toFixed(3)} (${esc(r.confidence_kind || "legacy")})</td></tr>
+      <tr><td>${tr("분류 방법")}</td><td>${esc(r.source || "-")}</td></tr>`;
+      if(r.vlm) html += `<tr><td>VLM</td><td>${esc(r.vlm.model)}: ${esc(statusLabel(r.vlm.status))} ${esc(r.vlm.reason || "")}</td></tr>`;
+      if(r.spatial_context) html += `<tr><td>${tr("소속 / 의미")}</td><td>${esc(statusLabel(r.spatial_context))} / ${esc(tr(TYPE_LABELS[r.semantic_type] || r.semantic_type))}</td></tr>`;
+  if(r.metrics) html += `<tr><td>${tr("지표")}</td><td>${Object.entries(r.metrics)
       .map(([k,v])=>`${k}=${v}`).join(", ")}</td></tr>`;
-  if(r.words?.length) html += `<tr><td>단어 수</td><td>${r.words.length}</td></tr>`;
-  if(r.num_polylines) html += `<tr><td>폴리라인</td><td>${r.num_polylines}개</td></tr>`;
-  if(r.table) html += `<tr><td>표 구조</td><td>${r.table.rows}행 × ${r.table.cols}열, 셀 ${r.table.num_cells}개</td></tr>`;
+  if(r.words?.length) html += `<tr><td>${tr("단어 수")}</td><td>${r.words.length}</td></tr>`;
+  if(r.num_polylines) html += `<tr><td>${tr("폴리라인")}</td><td>${r.num_polylines}</td></tr>`;
+  if(r.table) html += `<tr><td>${tr("표 구조")}</td><td>${tr("{rows}행 × {cols}열, 셀 {cells}개", {...r.table, cells:r.table.num_cells})}</td></tr>`;
   html += `</table>`;
   if(r.text) html += `<div class="txtbox">${esc(r.text)}</div>`;
   if(r.table) html += cellGridHtml(r.table);
@@ -580,10 +673,10 @@ async function renderDetail(){
     if(state.detailTab === "vec" && !hasVec) state.detailTab = "crop";
     if(state.detailTab === "crop" && !hasCrop) state.detailTab = "vec";
     html += `<div class="minitabs">`;
-    if(hasCrop) html += `<button class="smallbtn ${state.detailTab==="crop"?"on":""}" onclick="setDetailTab('crop')">이미지</button>`;
-    if(hasVec)  html += `<button class="smallbtn ${state.detailTab==="vec"?"on":""}" onclick="setDetailTab('vec')">벡터</button>`;
+    if(hasCrop) html += `<button class="smallbtn ${state.detailTab==="crop"?"on":""}" onclick="setDetailTab('crop')">${tr("이미지")}</button>`;
+    if(hasVec)  html += `<button class="smallbtn ${state.detailTab==="vec"?"on":""}" onclick="setDetailTab('vec')">${tr("벡터")}</button>`;
     if(r.svg_file) html += `<a class="smallbtn" style="text-decoration:none"
-        href="${fileUrl(state.file+"/"+state.page+"/"+r.svg_file)}" target="_blank">SVG 열기</a>`;
+        href="${fileUrl(state.file+"/"+state.page+"/"+r.svg_file)}" target="_blank">${tr("SVG 열기")}</a>`;
     html += `</div><div id="mediaBox"></div>`;
   }
   inner.innerHTML = html;
@@ -592,9 +685,9 @@ async function renderDetail(){
   if(!box) return;
   if(state.detailTab === "crop" && hasCrop){
     box.innerHTML = `<div class="imgbox"><img src="${fileUrl(state.file+"/"+state.page+"/"+r.image_file)}"></div>
-                     <div class="cap">영역 crop 이미지</div>`;
+                     <div class="cap">${tr("영역 이미지")}</div>`;
   }else if(state.detailTab === "vec" && hasVec){
-    box.innerHTML = `<div class="spin">벡터 로딩중…</div>`;
+    box.innerHTML = `<div class="spin">${tr("벡터 로딩 중…")}</div>`;
     try{
       const v = await getVectors(r.id);
       if(state.selId !== r.id) return;   // selection changed while loading
@@ -611,8 +704,8 @@ async function renderDetail(){
       box.innerHTML = "";
       const wrap = el("div", {class:"imgbox"}); wrap.appendChild(svg);
       box.append(wrap, el("div", {class:"cap"},
-        `폴리라인 ${v.num_polylines}개 · 연결그룹 ${v.num_groups}개 (그룹별 색상)`));
-    }catch(e){ box.innerHTML = `<div class="spin">벡터 로드 실패: ${esc(e.message)}</div>`; }
+        tr("폴리라인 {count}개 · 연결그룹 {groups}개", {count:v.num_polylines, groups:v.num_groups})));
+      }catch(e){ box.innerHTML = `<div class="spin">${esc(tr("벡터 로드 실패: {error}", {error:e.message}))}</div>`; }
   }
 }
 function setDetailTab(t){ state.detailTab = t; renderDetail(); }
@@ -654,23 +747,29 @@ wrap.addEventListener("wheel", ev => {
   v.k = k2;
   applyView();
 }, {passive:false});
-let pan = null;
+let pan = null, lastPanMoved = false;
+wrap.addEventListener("click", event => {
+  if(lastPanMoved){ event.preventDefault(); event.stopPropagation(); }
+}, true);
 wrap.addEventListener("pointerdown", ev => {
   if(ev.button !== 0) return;
+  lastPanMoved = false;
   pan = {sx:ev.clientX, sy:ev.clientY, ox:state.view.x, oy:state.view.y, moved:false};
-  wrap.classList.add("panning"); wrap.setPointerCapture(ev.pointerId);
+  wrap.classList.add("panning");
 });
 wrap.addEventListener("pointermove", ev => {
   if(!pan) return;
   const dx = ev.clientX - pan.sx, dy = ev.clientY - pan.sy;
-  if(Math.abs(dx) + Math.abs(dy) > 3) pan.moved = true;
+  if(Math.abs(dx) + Math.abs(dy) > 3){ pan.moved = true; wrap.setPointerCapture(ev.pointerId); }
+  if(!pan.moved) return;
   state.view.x = pan.ox + dx; state.view.y = pan.oy + dy; applyView();
 });
 wrap.addEventListener("pointerup", ev => {
   wrap.classList.remove("panning");
-  if(pan && !pan.moved) { /* plain click on background: keep selection */ }
+  lastPanMoved = !!pan?.moved;
   pan = null;
 });
+wrap.addEventListener("pointercancel", () => { pan = null; wrap.classList.remove("panning"); });
 $("#zoomFit").onclick = fitView;
 $("#zoom100").onclick = () => {
   const cw = wrap.clientWidth, ch = wrap.clientHeight, img = $("#pageImg");
@@ -724,8 +823,9 @@ initSplitter("splitD", e => {
   if(s.hdetail) rootStyle.setProperty("--h-detail", s.hdetail + "%");
 })();
 
+setLanguage(language);
 loadFiles().catch(e => { $("#fileList").innerHTML =
-  `<div style="padding:14px;color:#ff5252;font-size:12px">로드 실패: ${esc(e.message)}</div>`; });
+  `<div style="padding:14px;color:#ff5252;font-size:12px">${esc(tr("로드 실패: {error}", {error:e.message}))}</div>`; });
 </script>
 </body>
 </html>

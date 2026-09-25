@@ -160,6 +160,7 @@ python viewer.py --port 8000 --no-browser
 
 Features:
 
+- **Language**: Korean / English toggle with browser-local persistence; keeps the current page, selection, zoom and filters
 - **File navigation**: sidebar lists every parsed file under `output/` with its pages
 - **Page canvas**: page image with colored region bboxes (same colors as
   `overlay.png`), mouse wheel zoom / drag pan, original ⇄ overlay image toggle
@@ -167,10 +168,25 @@ Features:
 - **Region list & detail**: click a region on the canvas or in the list to see
   its type, confidence, bbox, OCR text, crop image and the vectorized polylines
   rendered as SVG (colored per connectivity group), plus "zoom to region";
-  table regions additionally show the parsed cell grid (merged cells preserved)
+  table regions additionally show the parsed cell grid (merged cells preserved).
+  Canvas selection highlights and scrolls to the matching list item; the selected ID appears above the list
 - **Type filter**: show/hide text / dimension / annotation / drawing / image / table regions
 
 No external service is needed for the viewer (Ollama is not used here).
+
+![Viewer demo: language switching, linked selection, table details and vectors](doc/viewer-demo.gif)
+
+To regenerate the demo, run the viewer on port 8003 with the sample outputs
+(`img1` and `img3`), then use the optional recording dependencies:
+
+```powershell
+python -m pip install playwright Pillow
+python -m playwright install chromium
+python tools/record_demo.py --url http://127.0.0.1:8003
+```
+
+The recorder also checks language persistence, selection, panning, vector assets
+and desktop/mobile layout. Use `--check-only` to skip writing the GIF.
 
 ## Configuration (config.json)
 
