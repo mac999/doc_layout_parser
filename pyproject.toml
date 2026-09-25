@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "doc-layout-parser"
+version = "0.1.0"
+description = "CLI document layout parser with an optional web viewer"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "PyMuPDF>=1.26",
+    "opencv-python>=4.10",
+    "scikit-image>=0.26",
+    "numpy>=2.0",
+    "easyocr>=1.7",
+    "shapely>=2.1",
+    "networkx>=3.0",
+    "jsonschema>=4.23",
+    "Flask>=3.0",
+]
+
+[project.optional-dependencies]
+ollama = ["ollama>=0.6"]
+openai = ["openai>=2.0"]
+gemini = ["google-genai>=2.0"]
+
+[project.scripts]
+doc-layout-parser = "main:main"
+doc-layout-parser-viewer = "viewer:main"
+
+[tool.setuptools]
+packages = ["pipeline"]
+py-modules = ["main", "viewer"]
+
+[tool.setuptools.package-data]
+pipeline = ["result.schema.json"]

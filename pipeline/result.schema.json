@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Parser output v1",
+  "oneOf": [{"$ref": "#/$defs/layout"}, {"$ref": "#/$defs/manifest"}],
+  "$defs": {
+    "bbox": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4},
+    "matrix": {"type": "array", "items": {"type": "number"}, "minItems": 6, "maxItems": 6},
+    "size": {
+      "type": "object", "required": ["width", "height"],
+      "properties": {"width": {"type": "integer", "minimum": 1}, "height": {"type": "integer", "minimum": 1}}
+    },
+    "region": {
+      "type": "object", "required": ["id", "type", "bbox", "source", "confidence", "confidence_kind"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "type": {"enum": ["text", "dimension", "annotation", "image", "drawing", "table"]},
+        "bbox": {"$ref": "#/$defs/bbox"}, "source": {"type": "string"},
+        "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "confidence_kind": {"type": "string"}
+      }
+    },
+    "layout": {
+      "type": "object",
+      "required": ["schema_version", "status", "page", "size", "coordinate_transform", "regions", "num_regions", "warnings"],
+      "properties": {
+        "schema_version": {"const": "1.0"}, "status": {"const": "complete"},
+        "page": {"type": "integer", "minimum": 1}, "size": {"$ref": "#/$defs/size"},
+        "num_regions": {"type": "integer", "minimum": 0},
+        "regions": {"type": "array", "items": {"$ref": "#/$defs/region"}},
+        "warnings": {"type": "array", "items": {"type": "string"}},
+        "coordinate_transform": {
+          "type": "object", "required": ["source_space", "source_to_pixel", "pixel_to_source"],
+          "properties": {
+            "source_space": {"type": "string"},
+            "source_to_pixel": {"$ref": "#/$defs/matrix"}, "pixel_to_source": {"$ref": "#/$defs/matrix"}
+          }
+        }
+      }
+    },
+    "manifest": {
+      "type": "object",
+      "required": ["schema_version", "run_id", "status", "source_file", "input", "config", "versions", "pages", "num_pages", "warnings"],
+      "properties": {
+        "schema_version": {"const": "1.0"}, "run_id": {"type": "string", "minLength": 1},
+        "status": {"enum": ["running", "complete", "failed"]},
+        "source_file": {"type": "string"},
+        "input": {
+          "type": "object", "required": ["path", "sha256"],
+          "properties": {"path": {"type": "string"}, "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}}
+        },
+        "config": {"type": "object"}, "versions": {"type": "object"},
+        "num_pages": {"type": "integer", "minimum": 0},
+        "warnings": {"type": "array", "items": {"type": "string"}},
+        "pages": {"type": "array", "items": {
+          "type": "object", "required": ["page", "status"],
+          "properties": {"page": {"type": "integer", "minimum": 1}, "status": {"enum": ["complete", "failed"]}}
+        }}
+      }
+    }
+  }
+}

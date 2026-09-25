@@ -16,6 +16,7 @@ from pathlib import Path
 from threading import Timer
 
 from flask import Flask, Response, abort, jsonify, send_file
+from pipeline.config import load_config, resolve_config_path
 
 ROOT = Path(__file__).parent
 
@@ -838,7 +839,7 @@ def main():
     ap = argparse.ArgumentParser(description="Web viewer for doc_layout_parser parsing results")
     ap.add_argument("-o", "--output", default=None,
                     help="output folder to browse (default: output_dir from config.json)")
-    ap.add_argument("-c", "--config", default=str(ROOT / "config.json"))
+    ap.add_argument("-c", "--config", default=None)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--no-browser", action="store_true", help="do not open the web browser")
@@ -847,12 +848,11 @@ def main():
     if args.output:
         out_root = Path(args.output)
     else:
-        out_dir = "output"
-        cfg_path = Path(args.config)
-        if cfg_path.exists():
-            with open(cfg_path, encoding="utf-8") as f:
-                out_dir = json.load(f).get("output_dir", "output")
-        out_root = Path(out_dir) if Path(out_dir).is_absolute() else ROOT / out_dir
+        config_path = resolve_config_path(args.config, ROOT)
+        cfg = load_config(config_path)
+        work_root = config_path.resolve().parent if config_path else Path.cwd()
+        out_path = Path(cfg["output_dir"])
+        out_root = out_path if out_path.is_absolute() else work_root / out_path
 
     if not out_root.exists():
         print(f"[WARN] output folder not found: {out_root} (run main.py first)")

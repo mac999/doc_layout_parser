@@ -1,1 +1,4 @@
 todo.md
+build/
+dist/
+*.egg-info/

@@ -144,6 +144,15 @@ def load_config(path: str | Path | None = None) -> dict:
     return cfg
 
 
+def resolve_config_path(path: str | Path | None = None, source_root: Path | None = None) -> Path | None:
+    if path is not None:
+        return Path(path)
+    candidates = [Path.cwd() / "config.json"]
+    if source_root is not None:
+        candidates.append(source_root / "config.json")
+    return next((candidate for candidate in candidates if candidate.is_file()), None)
+
+
 def preflight(cfg: dict, files: list[Path]) -> tuple[dict, list[str]]:
     """Check local prerequisites without model downloads or network calls."""
     validate_config(cfg)

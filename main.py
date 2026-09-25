@@ -23,7 +23,7 @@ import os
 from contextlib import closing
 from pathlib import Path
 
-from pipeline.config import load_config, preflight, validate_config
+from pipeline.config import load_config, preflight, resolve_config_path, validate_config
 from pipeline.loader import load_pages, maybe_upscale, IMAGE_EXTS
 from pipeline.ocr import get_text_items
 from pipeline.regions import detect_graphic_regions, classify_graphic_heuristic, reclassify_text_regions
@@ -233,19 +233,23 @@ def _process_file(file_path: Path, cfg: dict, out_dir: Path, manifest: dict) -> 
 
 def main():
     ap = argparse.ArgumentParser(description="Drawing/document layout parsing and vectorization pipeline")
-    ap.add_argument("-c", "--config", default=str(ROOT / "config.json"))
+    ap.add_argument("-c", "--config", default=None)
     ap.add_argument("-i", "--input", default=None,
                     help="single input file path (omit to process the whole input_dir)")
     ap.add_argument("--check", action="store_true", help="check prerequisites without processing")
     args = ap.parse_args()
 
-    cfg = load_config(args.config)
-    out_root = (ROOT / cfg["output_dir"]) if not Path(cfg["output_dir"]).is_absolute() else Path(cfg["output_dir"])
+    config_path = resolve_config_path(args.config, ROOT)
+    cfg = load_config(config_path)
+    work_root = config_path.resolve().parent if config_path else Path.cwd()
+    out_path = Path(cfg["output_dir"])
+    out_root = out_path if out_path.is_absolute() else work_root / out_path
 
     if args.input:
         files = [Path(args.input)]
     else:
-        in_dir = (ROOT / cfg["input_dir"]) if not Path(cfg["input_dir"]).is_absolute() else Path(cfg["input_dir"])
+        in_path = Path(cfg["input_dir"])
+        in_dir = in_path if in_path.is_absolute() else work_root / in_path
         files = sorted(p for p in in_dir.iterdir()
                        if p.suffix.lower() in IMAGE_EXTS | {".pdf"})
     cfg, warnings = preflight(cfg, files)

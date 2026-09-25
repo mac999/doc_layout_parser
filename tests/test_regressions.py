@@ -12,7 +12,7 @@ import fitz
 import numpy as np
 import cv2
 from pipeline.vlm import VlmSession, _parse_label
-from pipeline.config import DEFAULTS, load_config, validate_config, preflight
+from pipeline.config import DEFAULTS, load_config, resolve_config_path, validate_config, preflight
 from pipeline.loader import load_pages, maybe_upscale, _bezier_points, PageData
 from shapely.geometry import LineString
 from pipeline.regions import mask_text, reclassify_text_regions
@@ -25,6 +25,11 @@ from viewer import create_app
 
 
 class ContractTests(unittest.TestCase):
+    def test_packaged_and_documented_schemas_match(self):
+        root = Path(__file__).parents[1]
+        self.assertEqual((root / "pipeline" / "result.schema.json").read_bytes(),
+                         (root / "doc" / "result.schema.json").read_bytes())
+
     def test_missing_fields_bounds_and_files(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -125,6 +130,25 @@ class VlmTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_resolve_config_path_prefers_working_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            working = root / "working"
+            source = root / "source"
+            working.mkdir()
+            source.mkdir()
+            working_config = working / "config.json"
+            source_config = source / "config.json"
+            working_config.touch()
+            source_config.touch()
+            with patch("pipeline.config.Path.cwd", return_value=working):
+                self.assertEqual(resolve_config_path(None, source), working_config)
+                self.assertEqual(resolve_config_path("custom.json", source), Path("custom.json"))
+                working_config.unlink()
+                self.assertEqual(resolve_config_path(None, source), source_config)
+                source_config.unlink()
+                self.assertIsNone(resolve_config_path(None, source))
+
     def test_cpu_fallback_and_fail_fast(self):
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "scan.png"

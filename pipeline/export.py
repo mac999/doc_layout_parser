@@ -32,7 +32,7 @@ def save_json(path: Path, data) -> None:
 
 @lru_cache(maxsize=1)
 def output_validator():
-    schema = json.loads((Path(__file__).parents[1] / "doc" / "result.schema.json").read_text(encoding="utf-8"))
+    schema = json.loads((Path(__file__).parent / "result.schema.json").read_text(encoding="utf-8"))
     Draft202012Validator.check_schema(schema)
     return Draft202012Validator(schema)
 

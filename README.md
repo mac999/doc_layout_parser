@@ -241,9 +241,26 @@ Prerequisites:
 conda create -n venv_lmm python=3.11
 conda activate venv_lmm
 
-# Install dependencies
-pip install -r requirements.txt
+# From a cloned repository, install the package and its core dependencies
+python -m pip install .
+
+# Optional VLM provider (choose one or more)
+python -m pip install ".[ollama]"
+# python -m pip install ".[openai]"
+# python -m pip install ".[gemini]"
 ```
+
+To install directly from GitHub without cloning first:
+
+```powershell
+python -m pip install "git+https://github.com/mac999/doc_layout_parser.git"
+```
+
+This installs `doc-layout-parser` and `doc-layout-parser-viewer` commands.
+By default, the commands use `config.json` in the current working directory
+when present; otherwise they use built-in defaults. Relative input/output paths
+are based on that config file's directory, or the current directory when no
+config file is found.
 
 Notes:
 
@@ -280,6 +297,13 @@ python main.py --check
 # Show all supported options
 python main.py --help
 python viewer.py --help
+```
+
+After installation, the equivalent entry points are:
+
+```powershell
+doc-layout-parser --input "C:\documents\drawing.pdf"
+doc-layout-parser-viewer --output .\output --port 8000 --no-browser
 ```
 
 | Command | Option | Purpose |
