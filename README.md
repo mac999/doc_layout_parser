@@ -4,6 +4,7 @@ A parser pipeline that reads drawing/document files (jpg, png, pdf), splits them
 annotation / image / drawing / table** regions, extracts information per region type (table structure with per-cell text included), and vectorizes drawing regions into polylines. Every extracted item carries its pixel coordinates.
 
 <p align="center">
+<img src="./doc/viewer-demo.gif" width="800" alt="Viewer demo: language switching, linked selection, table details and vectors"></img> </br>
 <img src="./doc/img4.png" width="500"></img> </br>
 <img src="./doc/img1.png" width="500"></img> </br>
 <img src="./doc/img2.png" width="500"></img> </br>
@@ -173,8 +174,6 @@ Features:
 - **Type filter**: show/hide text / dimension / annotation / drawing / image / table regions
 
 No external service is needed for the viewer (Ollama is not used here).
-
-![Viewer demo: language switching, linked selection, table details and vectors](doc/viewer-demo.gif)
 
 To regenerate the demo, run the viewer on port 8003 with the sample outputs
 (`img1` and `img3`), then use the optional recording dependencies:
