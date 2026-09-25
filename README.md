@@ -1,7 +1,9 @@
 # Doc layout parser
 
-A parser pipeline that reads drawing/document files (jpg, png, pdf), splits them into pages, classifies the layout of each page into **text / dimension /
+A CLI-first parser pipeline that reads drawing/document files (jpg, png, pdf), splits them into pages, classifies the layout of each page into **text / dimension /
 annotation / image / drawing / table** regions, extracts information per region type (table structure with per-cell text included), and vectorizes drawing regions into polylines. Every extracted item carries its pixel coordinates.
+
+Run parsing headlessly from the command line, then inspect saved results with the optional Flask web viewer.
 
 <p align="center">
 <img src="./doc/viewer-demo.gif" width="800" alt="Viewer demo: language switching, linked selection, table details and vectors"></img> </br>
@@ -12,6 +14,13 @@ annotation / image / drawing / table** regions, extracts information per region 
 </p>
 
 ## Overview
+
+The parser and viewer run independently: `main.py` processes one file or a batch,
+while `viewer.py` serves existing results to a browser. The viewer does not submit parsing jobs.
+
+```text
+CLI (main.py) -> saved JSON / images / SVG -> web viewer (viewer.py) -> browser
+```
 
 ```
 input/*.{jpg,png,pdf}
@@ -115,7 +124,7 @@ Notes:
 - Commercial VLM providers are optional. Set the API key via environment
   variables: `OPENAI_API_KEY` or `GOOGLE_API_KEY`.
 
-## Usage
+## CLI usage
 
 Before running (with the default `config.json`):
 
@@ -140,7 +149,27 @@ python main.py -i input\img1.jpg
 
 # Use a different configuration file
 python main.py -c my_config.json
+
+# Check prerequisites without parsing or writing results
+python main.py --check
+
+# Show all supported options
+python main.py --help
+python viewer.py --help
 ```
+
+| Command | Option | Purpose |
+|---|---|---|
+| `main.py` | `-i`, `--input FILE` | Process one file; omit to process supported files directly in the configured `input_dir` |
+| `main.py` | `-c`, `--config FILE` | Load configuration, including `input_dir` and `output_dir` |
+| `main.py` | `--check` | Validate configuration and prerequisites without processing |
+| `viewer.py` | `-o`, `--output DIR` | Serve an existing result directory |
+| `viewer.py` | `-c`, `--config FILE` | Read `output_dir` when `--output` is omitted |
+| `viewer.py` | `--host HOST`, `--port PORT` | Bind address and port; defaults: `127.0.0.1:8000` |
+| `viewer.py` | `--no-browser` | Start without opening a local browser |
+
+The parser exits with code `0` on success and nonzero on failure, including failed
+files in a batch, so shell scripts and schedulers can detect errors.
 
 On this machine the pipeline runs under the conda environment `venv_lmm`:
 
@@ -174,6 +203,26 @@ Features:
 - **Type filter**: show/hide text / dimension / annotation / drawing / image / table regions
 
 No external service is needed for the viewer (Ollama is not used here).
+
+### Server use
+
+The CLI supports headless batch jobs through cron, systemd or Windows Task Scheduler.
+Run from the project directory with the configured Python environment and model dependencies:
+
+```sh
+python main.py -c config.json --check
+python main.py -c config.json
+# Trusted-network preview: open http://SERVER_IP:8000 in a browser
+python viewer.py -o output --host 0.0.0.0 --port 8000 --no-browser
+```
+
+`0.0.0.0` listens on all interfaces. Restrict network access: the viewer has no
+authentication and exposes files under the selected output directory. Its built-in
+Flask server is for development; production hosting requires a WSGI server using
+`viewer.create_app(Path(...))`, with authentication and TLS at a reverse proxy.
+CLI support does not provide a parsing HTTP API or job queue. Keep one parser writer per input.
+
+### Demo recording
 
 To regenerate the demo, run the viewer on port 8003 with the sample outputs
 (`img1` and `img3`), then use the optional recording dependencies:
