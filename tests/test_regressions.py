@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import main
+import viewer
 import fitz
 import numpy as np
 import cv2
@@ -74,6 +75,64 @@ class ViewerTests(unittest.TestCase):
             self.assertEqual(response["files"][0]["status"], "incomplete")
             self.assertEqual(len(response["failures"]), 1)
             self.assertEqual(client.get("/").status_code, 200)
+
+    def test_local_processing_is_opt_in_and_restricted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            input_dir = root / "input"
+            input_dir.mkdir()
+            (input_dir / "scan.png").touch()
+            (root / "config.json").write_text("{}", encoding="utf-8")
+            client = create_app(root / "output", input_root=input_dir, workspace_root=root,
+                                config_path=root / "config.json", enable_local_processing=True).test_client()
+            self.assertEqual(client.get("/api/local/settings").status_code, 200)
+            listing = client.get("/api/local/browse", query_string={"path": str(root), "mode": "input"})
+            self.assertEqual(listing.status_code, 200)
+            self.assertIn("input", [entry["name"] for entry in listing.json["entries"]])
+            outside = Path.home().parent.resolve()
+            denied = client.get("/api/local/browse", query_string={"path": str(outside)})
+            self.assertEqual(denied.status_code, 403)
+            remote = client.get("/api/local/settings", environ_overrides={"REMOTE_ADDR": "192.0.2.1"})
+            self.assertEqual(remote.status_code, 403)
+            disabled = create_app(root / "output").test_client()
+            self.assertEqual(disabled.get("/api/local/settings").status_code, 404)
+
+    def test_local_processing_validates_and_starts_only_one_job(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            input_dir = root / "input"
+            input_dir.mkdir()
+            (input_dir / "scan.png").touch()
+            config_file = root / "config.json"
+            config_file.write_text(json.dumps({"ocr": {"gpu": False}, "classify": {"use_vlm": False}}),
+                                   encoding="utf-8")
+            app = create_app(root / "output", input_root=input_dir, workspace_root=root,
+                             config_path=config_file, enable_local_processing=True)
+            client = app.test_client()
+            with patch("viewer.preflight", side_effect=lambda cfg, files: (cfg, [])), \
+                    patch("viewer.threading.Thread") as thread:
+                response = client.post("/api/local/process", json={"input_dir": str(input_dir),
+                                                                     "config_path": str(config_file)})
+                self.assertEqual(response.status_code, 202)
+                self.assertTrue(thread.return_value.start.called)
+                config = thread.call_args.kwargs["args"][1]
+                self.assertEqual(config["input_dir"], str(input_dir.resolve()))
+                self.assertEqual(config["output_dir"], str((root / "output").resolve()))
+                self.assertFalse(config["ocr"]["gpu"])
+                self.assertFalse(config["classify"]["use_vlm"])
+                duplicate = client.post("/api/local/process", json={"input_dir": str(input_dir),
+                                                                      "config_path": str(config_file)})
+                self.assertEqual(duplicate.status_code, 409)
+                invalid = client.post("/api/local/process", json={"input_dir": str(Path.home().parent)})
+                self.assertEqual(invalid.status_code, 403)
+                worker = thread.call_args.kwargs["target"]
+                args = thread.call_args.kwargs["args"]
+                fake_process = SimpleNamespace(stdout=["Processing scan.png\n"], wait=lambda: 0)
+                with patch("viewer.subprocess.Popen", return_value=fake_process):
+                    worker(*args)
+                completed = client.get(f"/api/local/jobs/{response.json['id']}")
+                self.assertEqual(completed.json["status"], "complete")
+                self.assertIn("Processing scan.png", completed.json["log"])
 
 
 class EvaluationTests(unittest.TestCase):

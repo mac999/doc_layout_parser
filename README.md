@@ -352,6 +352,21 @@ Features:
 
 No external service is needed for the viewer (Ollama is not used here).
 
+To choose a server-side input folder and config file in the viewer, then start
+parsing and monitor the job, explicitly enable local processing:
+
+```powershell
+python viewer.py --enable-local-processing
+# Installed command:
+doc-layout-parser-viewer --enable-local-processing
+```
+
+The folder picker is limited to the server process's working folder, home folder,
+and configured input/config locations. Processing is disabled by default and the
+option requires a loopback host; do not combine it with `--host 0.0.0.0` or expose
+it through a public/reverse-proxy endpoint. Select a config JSON or use built-in
+defaults. Jobs use the viewer's selected output directory and run one at a time.
+
 ### Server use
 
 The CLI supports headless batch jobs through cron, systemd or Windows Task Scheduler.

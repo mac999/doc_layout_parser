@@ -11,33 +11,124 @@ Usage:
 """
 import argparse
 import json
+import subprocess
+import sys
+import tempfile
+import threading
+import uuid
 import webbrowser
 from pathlib import Path
 from threading import Timer
 
-from flask import Flask, Response, abort, jsonify, send_file
-from pipeline.config import load_config, resolve_config_path
+from flask import Flask, Response, abort, jsonify, request, send_file
+from pipeline.config import load_config, preflight, resolve_config_path
+from pipeline.loader import IMAGE_EXTS
+from werkzeug.exceptions import HTTPException
 
 ROOT = Path(__file__).parent
 
 
 # ---------------------------------------------------------------- server ---
 
-def create_app(out_root: Path) -> Flask:
+
+def create_app(
+    out_root: Path,
+    *,
+    input_root: Path | None = None,
+    config_path: Path | None = None,
+    workspace_root: Path | None = None,
+    enable_local_processing: bool = False,
+) -> Flask:
     app = Flask(__name__)
     out_root = out_root.resolve()
+    workspace_root = (workspace_root or Path.cwd()).resolve()
+    initial_input = (input_root or (workspace_root / "input")).resolve()
+    selected_config = config_path.resolve() if config_path else None
+    jobs = {}
+    jobs_lock = threading.Lock()
+
+    def local_processing_required():
+        if not enable_local_processing:
+            abort(404)
+        if request.remote_addr not in {"127.0.0.1", "::1"}:
+            abort(403)
+
+    def allowed_roots():
+        roots = (
+            workspace_root,
+            Path.home(),
+            initial_input,
+            selected_config.parent if selected_config else workspace_root,
+        )
+        return tuple(dict.fromkeys(path.resolve() for path in roots))
+
+    def local_path(raw_path: str) -> Path:
+        path = Path(raw_path).expanduser().resolve()
+        if not any(
+            path == root or path.is_relative_to(root) for root in allowed_roots()
+        ):
+            abort(403, "Path is outside the local workspace and home folders")
+        return path
+
+    def run_parser(job_id: str, cfg: dict) -> None:
+        config_file = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", encoding="utf-8", delete=False
+            ) as stream:
+                json.dump(cfg, stream, ensure_ascii=False, indent=2)
+                config_file = Path(stream.name)
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-u",
+                    str(ROOT / "main.py"),
+                    "--config",
+                    str(config_file),
+                ],
+                cwd=workspace_root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            output = ""
+            for line in process.stdout:
+                output = (output + line)[-12000:]
+                with jobs_lock:
+                    jobs[job_id]["log"] = output
+            returncode = process.wait()
+            with jobs_lock:
+                jobs[job_id].update(
+                    status="complete" if returncode == 0 else "failed",
+                    returncode=returncode,
+                    log=output,
+                )
+        except Exception as error:
+            with jobs_lock:
+                jobs[job_id].update(status="failed", returncode=-1, log=str(error))
+        finally:
+            if config_file:
+                config_file.unlink(missing_ok=True)
 
     def safe_path(rel: str) -> Path:
-        p = (out_root / rel).resolve()
-        if not p.is_relative_to(out_root):
+        path = (out_root / rel).resolve()
+        if not path.is_relative_to(out_root):
             abort(403)
-        if not p.exists():
+        if not path.exists():
             abort(404)
-        return p
+        return path
 
-    def read_json(p: Path):
-        with open(p, encoding="utf-8") as f:
-            return json.load(f)
+    def read_json(path: Path):
+        with open(path, encoding="utf-8") as stream:
+            return json.load(stream)
+
+    @app.errorhandler(HTTPException)
+    def handle_http_error(error: HTTPException):
+        if request.path.startswith("/api/"):
+            return jsonify({"error": error.description}), error.code
+        return error
 
     @app.get("/")
     def index() -> Response:
@@ -48,34 +139,180 @@ def create_app(out_root: Path) -> Flask:
         """All parsed files: directories under out_root that contain result.json."""
         items = []
         if out_root.exists():
-            for d in sorted(out_root.iterdir()):
-                if d.name.startswith(".") or d.name == "_failures":
+            for directory in sorted(out_root.iterdir()):
+                if directory.name.startswith(".") or directory.name == "_failures":
                     continue
-                rj = d / "result.json"
-                if d.is_dir() and rj.exists():
+                result_path = directory / "result.json"
+                if directory.is_dir() and result_path.exists():
                     try:
-                        result = read_json(rj)
-                        missing = [page["dir"] for page in result.get("pages", [])
-                                   if page.get("dir") and not (d / page["dir"] / "layout.json").is_file()]
-                        items.append({"name": d.name, **result,
-                                      "status": "incomplete" if missing else result.get("status", "legacy")})
+                        result = read_json(result_path)
+                        missing = [
+                            page["dir"]
+                            for page in result.get("pages", [])
+                            if page.get("dir")
+                            and not (directory / page["dir"] / "layout.json").is_file()
+                        ]
+                        items.append(
+                            {
+                                "name": directory.name,
+                                **result,
+                                "status": (
+                                    "incomplete"
+                                    if missing
+                                    else result.get("status", "legacy")
+                                ),
+                            }
+                        )
                     except (json.JSONDecodeError, OSError):
-                        items.append({"name": d.name, "error": "result.json unreadable"})
+                        items.append(
+                            {"name": directory.name, "error": "result.json unreadable"}
+                        )
         failures = []
         for record in sorted((out_root / "_failures").glob("*.json")):
             try:
-                failures.append({"record": f"_failures/{record.name}", **read_json(record)})
+                failures.append(
+                    {"record": f"_failures/{record.name}", **read_json(record)}
+                )
             except (json.JSONDecodeError, OSError):
-                failures.append({"record": f"_failures/{record.name}", "error": "Unreadable failure record"})
-        return jsonify({"output_dir": str(out_root), "files": items, "failures": failures})
+                failures.append(
+                    {
+                        "record": f"_failures/{record.name}",
+                        "error": "Unreadable failure record",
+                    }
+                )
+        return jsonify(
+            {"output_dir": str(out_root), "files": items, "failures": failures}
+        )
+
+    @app.get("/api/local/settings")
+    def api_local_settings():
+        local_processing_required()
+        return jsonify(
+            {
+                "input_dir": str(initial_input),
+                "config_path": str(selected_config) if selected_config else "",
+                "roots": [str(root) for root in allowed_roots()],
+                "output_dir": str(out_root),
+            }
+        )
+
+    @app.get("/api/local/browse")
+    def api_local_browse():
+        local_processing_required()
+        mode = request.args.get("mode", "input")
+        if mode not in {"input", "config"}:
+            abort(400, "mode must be input or config")
+        path = local_path(request.args.get("path", str(workspace_root)))
+        if not path.is_dir():
+            abort(400, "Selected path is not a directory")
+        entries = []
+        try:
+            children = sorted(
+                path.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower())
+            )
+            for child in children:
+                if child.name.startswith(".") or child.is_symlink():
+                    continue
+                try:
+                    is_directory = child.is_dir()
+                    is_config = (
+                        mode == "config"
+                        and child.is_file()
+                        and child.suffix.lower() == ".json"
+                    )
+                    if is_directory or is_config:
+                        local_path(str(child))
+                        entries.append(
+                            {
+                                "name": child.name,
+                                "path": str(child),
+                                "kind": "directory" if is_directory else "config",
+                            }
+                        )
+                except OSError:
+                    continue
+                if len(entries) >= 500:
+                    break
+        except OSError as error:
+            abort(400, str(error))
+        parents = [
+            root
+            for root in allowed_roots()
+            if path != root and path.is_relative_to(root)
+        ]
+        parent = max(parents, key=lambda root: len(str(root))) if parents else None
+        return jsonify(
+            {
+                "path": str(path),
+                "parent": str(path.parent) if parent else None,
+                "entries": entries,
+                "truncated": len(entries) >= 500,
+            }
+        )
+
+    @app.post("/api/local/process")
+    def api_local_process():
+        local_processing_required()
+        body = request.get_json(silent=True) or {}
+        input_value = body.get("input_dir")
+        if not isinstance(input_value, str) or not input_value.strip():
+            abort(400, "Input folder is required")
+        input_dir = local_path(input_value)
+        if not input_dir.is_dir():
+            abort(400, "Input folder does not exist")
+        config_value = str(body.get("config_path", "")).strip()
+        chosen_config = local_path(config_value) if config_value else selected_config
+        if chosen_config and (
+            chosen_config.suffix.lower() != ".json" or not chosen_config.is_file()
+        ):
+            abort(400, "Config file must be an existing JSON file")
+        try:
+            cfg = load_config(chosen_config)
+            files = sorted(
+                path
+                for path in input_dir.iterdir()
+                if path.is_file() and path.suffix.lower() in IMAGE_EXTS | {".pdf"}
+            )
+            cfg["input_dir"] = str(input_dir)
+            cfg["output_dir"] = str(out_root)
+            cfg, _ = preflight(cfg, files)
+        except (OSError, ValueError, RuntimeError) as error:
+            abort(400, str(error))
+        with jobs_lock:
+            if any(job["status"] == "running" for job in jobs.values()):
+                abort(409, "A parsing job is already running")
+            for finished_id in list(jobs)[:-25]:
+                if jobs[finished_id]["status"] != "running":
+                    jobs.pop(finished_id)
+            job_id = uuid.uuid4().hex
+            jobs[job_id] = {
+                "id": job_id,
+                "status": "running",
+                "input_dir": str(input_dir),
+                "config_path": (
+                    str(chosen_config) if chosen_config else "built-in defaults"
+                ),
+                "log": "Starting parser...",
+            }
+        threading.Thread(target=run_parser, args=(job_id, cfg), daemon=True).start()
+        return jsonify(jobs[job_id]), 202
+
+    @app.get("/api/local/jobs/<job_id>")
+    def api_local_job(job_id: str):
+        local_processing_required()
+        with jobs_lock:
+            job = jobs.get(job_id)
+            if job is None:
+                abort(404)
+            return jsonify(job)
 
     @app.get("/api/layout/<name>/<page_dir>")
     def api_layout(name: str, page_dir: str):
-        p = safe_path(f"{name}/{page_dir}/layout.json")
-        data = read_json(p)
-        data["has_overlay"] = (p.parent / "overlay.png").exists()
-        data["has_page_image"] = (p.parent / "page.png").exists()
-        data["has_native_vectors"] = (p.parent / "native_vectors.json").exists()
+        path = safe_path(f"{name}/{page_dir}/layout.json")
+        data = read_json(path)
+        data["has_overlay"] = (path.parent / "overlay.png").exists()
+        data["has_page_image"] = (path.parent / "page.png").exists()
+        data["has_native_vectors"] = (path.parent / "native_vectors.json").exists()
         return jsonify(data)
 
     @app.get("/api/vectors/<name>/<page_dir>/<rid>")
@@ -134,6 +371,29 @@ body.resizing iframe, body.resizing img, body.resizing-v img{pointer-events:none
 .language-switch button{min-width:64px}
 #side .sub{padding:0 16px 10px; color:var(--fg-dim); font-size:11px; border-bottom:1px solid var(--border);
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+#processPanel{padding:6px 10px 8px; border-bottom:1px solid var(--border); display:grid; gap:5px}
+.path-pick{display:flex; align-items:center; gap:6px; min-width:0; width:100%; border:1px solid var(--border);
+  border-radius:6px; background:var(--panel2); color:var(--fg); padding:5px 7px; cursor:pointer; text-align:left}
+.path-pick:hover{border-color:var(--accent)}
+.path-pick strong{font-size:11px; white-space:nowrap}
+.path-pick span{font-size:10px; color:var(--fg-dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+#processActions{display:flex; align-items:center; gap:6px}
+#processButton{background:var(--accent-dim); color:var(--fg)}
+#processStatus{font-size:10px; color:var(--fg-dim); overflow-wrap:anywhere; max-height:56px; overflow:auto; white-space:pre-wrap}
+#picker{position:fixed; z-index:20; inset:0; display:flex; align-items:center; justify-content:center; padding:16px;
+  background:#0009}
+#picker[hidden],#processPanel[hidden]{display:none}
+#pickerDialog{display:flex; flex-direction:column; width:min(520px,100%); max-height:min(640px,90vh);
+  background:var(--panel); border:1px solid var(--border); border-radius:8px; box-shadow:0 16px 50px #0008}
+#pickerHead{display:flex; align-items:center; gap:10px; padding:12px; border-bottom:1px solid var(--border)}
+#pickerTitle{font-size:13px; font-weight:600; flex:1}
+#pickerPath{padding:8px 12px; color:var(--fg-dim); font-size:11px; overflow-wrap:anywhere; border-bottom:1px solid var(--border)}
+#pickerRoots{display:flex; flex-wrap:wrap; gap:5px; padding:8px 12px}
+#pickerList{overflow:auto; padding:4px 8px 8px; min-height:100px}
+.picker-entry{display:flex; width:100%; gap:8px; padding:7px 8px; color:var(--fg); background:transparent;
+  border:0; border-radius:5px; text-align:left; cursor:pointer; font:inherit}
+.picker-entry:hover{background:var(--panel2)}
+#pickerFoot{padding:10px 12px; border-top:1px solid var(--border); display:flex; justify-content:flex-end; gap:6px}
 #fileList{overflow-y:auto; flex:1; padding:8px}
 .fitem{border-radius:var(--radius); margin-bottom:2px}
 .fitem>.fhead{display:flex; align-items:center; gap:8px; padding:7px 10px; cursor:pointer; border-radius:var(--radius)}
@@ -237,13 +497,16 @@ body.resizing iframe, body.resizing img, body.resizing-v img{pointer-events:none
 ::-webkit-scrollbar-track{background:transparent}
 @media(max-width:800px){
   body{overflow:auto}
-  #app{grid-template-columns:minmax(0,1fr); grid-template-rows:130px minmax(300px,1fr) 300px;
-    height:100dvh; min-height:760px}
+  #app{grid-template-columns:minmax(0,1fr); grid-template-rows:190px minmax(300px,1fr) 300px;
+    height:100dvh; min-height:790px}
   .vsplit{display:none}
   #side,#detail{min-height:0}
   #side h1{padding-top:6px}
   #side .sub{display:none}
   .language-switch{margin-bottom:2px}
+  #processPanel{padding:3px 8px 5px; gap:3px}
+  .path-pick{padding:3px 6px}
+  #processStatus{max-height:30px}
   #toolbar{gap:5px; padding:6px}
   #crumb{flex-basis:100%}
 }
@@ -256,6 +519,15 @@ body.resizing iframe, body.resizing img, body.resizing-v img{pointer-events:none
     <div class="tgroup language-switch" role="group" aria-label="Language">
       <button class="tbtn" data-lang="ko" lang="ko">한국어</button>
       <button class="tbtn" data-lang="en" lang="en">English</button>
+    </div>
+    <div id="processPanel" hidden>
+      <button class="path-pick" id="inputPathButton" type="button"><strong id="inputPathLabel">입력</strong><span id="inputPath"></span></button>
+      <button class="path-pick" id="configPathButton" type="button"><strong id="configPathLabel">설정</strong><span id="configPath"></span></button>
+      <div id="processActions">
+        <button class="tbtn" id="processButton" type="button">처리</button>
+        <span id="processSummary"></span>
+      </div>
+      <pre id="processStatus" role="status" aria-live="polite"></pre>
     </div>
     <div class="sub" id="outdir"></div>
     <div id="fileList"></div>
@@ -300,6 +572,15 @@ body.resizing iframe, body.resizing img, body.resizing-v img{pointer-events:none
     <div id="rdetail"><div class="inner" id="rdetailInner"></div></div>
   </aside>
 </div>
+<div id="picker" hidden>
+  <section id="pickerDialog" role="dialog" aria-modal="true" aria-labelledby="pickerTitle">
+    <div id="pickerHead"><span id="pickerTitle"></span><button class="tbtn" id="pickerClose" type="button" aria-label="닫기">✕</button></div>
+    <div id="pickerRoots"></div>
+    <div id="pickerPath"></div>
+    <div id="pickerList"></div>
+    <div id="pickerFoot"><button class="tbtn" id="pickerChoose" type="button"></button></div>
+  </section>
+</div>
 
 <script>
 "use strict";
@@ -320,7 +601,15 @@ const EN = {
   "벡터 로드 실패: {error}":"Vector load failed: {error}", "로드 실패: {error}":"Load failed: {error}",
   "실패":"Failed", "완료":"Complete", "불완전":"Incomplete", "이전 형식":"Legacy", "읽기 오류":"Unreadable",
   "처리 중":"Running", "소속 / 의미":"Context / meaning", "표 내부":"In table", "도면 내부":"In drawing",
-  "지표":"Metrics", "성공":"OK", "생략":"Skipped"
+  "지표":"Metrics", "성공":"OK", "생략":"Skipped",
+  "입력":"Input", "설정":"Config", "처리":"Process", "처리 중":"Processing",
+  "완료":"Complete", "실패":"Failed", "입력 폴더 선택":"Select input folder",
+  "설정 파일 선택":"Select config file", "현재 폴더 선택":"Use this folder",
+  "설정 파일 선택 해제":"Use built-in defaults", "폴더를 선택하세요":"Choose a folder",
+  "폴더가 비어 있습니다":"No folders or config files", "폴더 선택 기능은 로컬 실행에서만 사용할 수 있습니다":"Folder selection is only available in local mode",
+  "지원 입력 {count}개":"{count} supported inputs", "입력 파일이 없습니다":"No supported input files",
+  "설정 오류":"Configuration error", "파일을 읽을 수 없습니다":"Cannot read folder",
+  "현재 폴더":"Current folder", "로컬 입력 처리":"Local input processing", "기본 설정":"Built-in defaults"
 };
 const STATUS_LABELS = {failed:"실패", complete:"완료", incomplete:"불완전", legacy:"이전 형식", unreadable:"읽기 오류",
   running:"처리 중", ok:"성공", skipped:"생략", in_table:"표 내부", in_drawing:"도면 내부"};
@@ -363,7 +652,8 @@ function setLanguage(value){
   });
   for(const [selector,text] of Object.entries({
     '#regionHeading':"레이아웃 영역",'[data-base="page"]':"원본",'[data-base="overlay"]':"오버레이",
-    '#lyBbox':"영역 박스",'#lyVec':"벡터",'#lyNative':"PDF 벡터",'#zoomFit':"맞춤"
+    '#lyBbox':"영역 박스",'#lyVec':"벡터",'#lyNative':"PDF 벡터",'#zoomFit':"맞춤",
+    '#inputPathLabel':"입력",'#configPathLabel':"설정",'#processButton':"처리"
   })) $(selector).textContent = tr(text);
   $("#zoomFit").title = tr("화면 맞춤");
   $("#rlist").setAttribute("aria-label", tr("레이아웃 영역"));
@@ -378,6 +668,115 @@ document.querySelectorAll("[data-lang]").forEach(button => button.onclick = () =
 
 async function jget(url){ const r = await fetch(url); if(!r.ok) throw new Error(url+" -> "+r.status); return r.json(); }
 const fileUrl = rel => "/files/" + rel.split("/").map(enc).join("/");
+
+const processing = {settings:null, mode:"input", currentPath:"", configChoice:""};
+function showSelectedPaths(){
+  $("#inputPath").textContent = processing.settings?.input_dir || "";
+  $("#inputPath").title = processing.settings?.input_dir || "";
+  const configPath = processing.settings?.config_path || tr("기본 설정");
+  $("#configPath").textContent = configPath;
+  $("#configPath").title = configPath;
+}
+async function initLocalProcessing(){
+  try{
+    processing.settings = await jget("/api/local/settings");
+    $("#processPanel").hidden = false;
+    showSelectedPaths();
+    $("#inputPathButton").onclick = () => openPicker("input");
+    $("#configPathButton").onclick = () => openPicker("config");
+    $("#processButton").onclick = startProcessing;
+    $("#pickerClose").onclick = closePicker;
+    $("#picker").addEventListener("click", event => { if(event.target.id === "picker") closePicker(); });
+    $("#pickerChoose").onclick = choosePickerPath;
+  }catch(error){
+    if(error.message.includes("404") || error.message.includes("403")) return;
+    console.error("Local processing settings failed", error);
+  }
+}
+function closePicker(){ $("#picker").hidden = true; }
+async function openPicker(mode){
+  processing.mode = mode;
+  processing.configChoice = "";
+  $("#pickerTitle").textContent = tr(mode === "input" ? "입력 폴더 선택" : "설정 파일 선택");
+  $("#pickerChoose").textContent = tr(mode === "input" ? "현재 폴더 선택" : "기본 설정");
+  $("#picker").hidden = false;
+  const roots = processing.settings.roots;
+  const rootBox = $("#pickerRoots"); rootBox.innerHTML = "";
+  for(const root of roots){
+    const button = el("button", {class:"smallbtn", type:"button"}, esc(root));
+    button.onclick = () => browsePicker(root);
+    rootBox.appendChild(button);
+  }
+  const initial = mode === "input" ? processing.settings.input_dir :
+    (processing.settings.config_path ? processing.settings.config_path.replace(/[\\/][^\\/]+$/, "") : roots[0]);
+  try{ await browsePicker(initial); }
+  catch(error){ $("#pickerList").textContent = `${tr("파일을 읽을 수 없습니다")}: ${error.message}`; }
+}
+async function browsePicker(path){
+  processing.currentPath = path;
+  const data = await jget(`/api/local/browse?mode=${processing.mode}&path=${enc(path)}`);
+  processing.currentPath = data.path;
+  $("#pickerPath").textContent = data.path;
+  const list = $("#pickerList"); list.innerHTML = "";
+  if(data.parent){
+    const up = el("button", {class:"picker-entry", type:"button"}, `📁 ..`);
+    up.onclick = () => browsePicker(data.parent);
+    list.appendChild(up);
+  }
+  for(const entry of data.entries){
+    const button = el("button", {class:"picker-entry", type:"button"});
+    button.textContent = `${entry.kind === "directory" ? "📁" : "▤"} ${entry.name}`;
+    button.onclick = () => entry.kind === "directory" ? browsePicker(entry.path) :
+      (processing.configChoice = entry.path, $("#pickerPath").textContent = entry.path);
+    list.appendChild(button);
+  }
+  if(!data.entries.length) list.appendChild(el("div", {class:"picker-entry"}, tr("폴더가 비어 있습니다")));
+  if(data.truncated) list.appendChild(el("div", {class:"picker-entry"}, "500+"));
+}
+function choosePickerPath(){
+  if(processing.mode === "input") processing.settings.input_dir = processing.currentPath;
+  else processing.settings.config_path = processing.configChoice;
+  showSelectedPaths();
+  closePicker();
+}
+async function startProcessing(){
+  const button = $("#processButton");
+  button.disabled = true;
+  $("#processSummary").textContent = tr("처리 중");
+  $("#processStatus").textContent = "";
+  try{
+    const response = await fetch("/api/local/process", {method:"POST", headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(processing.settings)});
+    const job = await response.json();
+    if(!response.ok) throw new Error(job.message || job.error || `HTTP ${response.status}`);
+    await pollProcessing(job.id);
+  }catch(error){
+    $("#processSummary").textContent = tr("실패");
+    $("#processStatus").textContent = error.message;
+    button.disabled = false;
+  }
+}
+async function pollProcessing(jobId){
+  const job = await jget(`/api/local/jobs/${enc(jobId)}`);
+  $("#processStatus").textContent = job.log || "";
+  if(job.status === "running") return setTimeout(() => pollProcessing(jobId).catch(showProcessingError), 900);
+  $("#processSummary").textContent = tr(job.status === "complete" ? "완료" : "실패");
+  $("#processButton").disabled = false;
+  if(job.status === "complete"){
+    await loadFiles();
+    const latest = [...state.files].sort((left,right) =>
+      Date.parse(right.started_at || "") - Date.parse(left.started_at || ""))[0];
+    if(latest?.pages?.length){
+      const firstPage = latest.pages.find(item => item.dir && item.status !== "failed");
+      if(firstPage) await selectPage(latest.name, firstPage.dir);
+    }
+  }
+}
+function showProcessingError(error){
+  $("#processSummary").textContent = tr("실패");
+  $("#processStatus").textContent = error.message;
+  $("#processButton").disabled = false;
+}
 
 /* ---------------- sidebar ---------------- */
 async function loadFiles(){
@@ -825,6 +1224,7 @@ initSplitter("splitD", e => {
 })();
 
 setLanguage(language);
+initLocalProcessing();
 loadFiles().catch(e => { $("#fileList").innerHTML =
   `<div style="padding:14px;color:#ff5252;font-size:12px">${esc(tr("로드 실패: {error}", {error:e.message}))}</div>`; });
 </script>
@@ -843,21 +1243,30 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--no-browser", action="store_true", help="do not open the web browser")
+    ap.add_argument("--enable-local-processing", action="store_true",
+            help="enable local folder browsing and parser jobs (loopback only)")
     args = ap.parse_args()
 
+    if args.enable_local_processing and args.host not in {"127.0.0.1", "localhost", "::1"}:
+      ap.error("--enable-local-processing requires a loopback --host")
+
+    config_path = resolve_config_path(args.config, ROOT)
+    cfg = load_config(config_path)
+    work_root = config_path.resolve().parent if config_path else Path.cwd()
+    input_path = Path(cfg["input_dir"])
+    input_root = input_path if input_path.is_absolute() else work_root / input_path
     if args.output:
-        out_root = Path(args.output)
+      output_path = Path(args.output)
+      out_root = output_path if output_path.is_absolute() else Path.cwd() / output_path
     else:
-        config_path = resolve_config_path(args.config, ROOT)
-        cfg = load_config(config_path)
-        work_root = config_path.resolve().parent if config_path else Path.cwd()
-        out_path = Path(cfg["output_dir"])
-        out_root = out_path if out_path.is_absolute() else work_root / out_path
+      output_path = Path(cfg["output_dir"])
+      out_root = output_path if output_path.is_absolute() else work_root / output_path
 
     if not out_root.exists():
         print(f"[WARN] output folder not found: {out_root} (run main.py first)")
 
-    app = create_app(out_root)
+    app = create_app(out_root, input_root=input_root, config_path=config_path,
+             workspace_root=work_root, enable_local_processing=args.enable_local_processing)
     url = f"http://{args.host}:{args.port}"
     print(f"Serving {out_root} at {url}  (Ctrl+C to stop)")
     if not args.no_browser:
