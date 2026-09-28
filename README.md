@@ -285,6 +285,9 @@ Complete [Installation](#installation) before running these commands.
 # Process every supported file in the input folder (config.json: input_dir)
 python main.py
 
+# Also export parsed text and tables to document.md in each result folder
+python main.py --markdown
+
 # Process a single file
 python main.py -i input\img1.jpg
 
@@ -303,7 +306,7 @@ After installation, the equivalent entry points are:
 
 ```powershell
 doc-layout-parser --input "C:\documents\drawing.pdf"
-doc-layout-parser-viewer --output .\output --port 8000 --no-browser
+doc-layout-parser-viewer --output .\output --port 8000 --no-browser --enable-local-processing
 ```
 
 | Command | Option | Purpose |
@@ -311,10 +314,14 @@ doc-layout-parser-viewer --output .\output --port 8000 --no-browser
 | `main.py` | `-i`, `--input FILE` | Process one file; omit to process supported files directly in the configured `input_dir` |
 | `main.py` | `-c`, `--config FILE` | Load configuration, including `input_dir` and `output_dir` |
 | `main.py` | `--check` | Validate configuration and prerequisites without processing |
+| `main.py` | `--markdown` | Also write `document.md` with page-ordered text and parsed tables |
+| `main.py` | `--skip-existing` | Leave existing per-input output folders untouched and log skipped inputs |
 | `viewer.py` | `-o`, `--output DIR` | Serve an existing result directory |
 | `viewer.py` | `-c`, `--config FILE` | Read `output_dir` when `--output` is omitted |
 | `viewer.py` | `--host HOST`, `--port PORT` | Bind address and port; defaults: `127.0.0.1:8000` |
 | `viewer.py` | `--no-browser` | Start without opening a local browser |
+| `viewer.py` | `--enable-local-processing` | Enable local processing explicitly; already the default on loopback hosts |
+| `viewer.py` | `--read-only` | Hide processing controls and only browse existing results |
 
 The parser exits with code `0` on success and nonzero on failure, including failed
 files in a batch, so shell scripts and schedulers can detect errors.
@@ -352,20 +359,28 @@ Features:
 
 No external service is needed for the viewer (Ollama is not used here).
 
-To choose a server-side input folder and config file in the viewer, then start
-parsing and monitor the job, explicitly enable local processing:
+Localhost launches show input/output/config selectors and processing options in
+the top menu, with logs in the left panel. Markdown generation is checked by
+default; Skip existing results is unchecked. The Process button changes to Stop
+while a job runs and returns to Process after completion or cancellation.
 
 ```powershell
-python viewer.py --enable-local-processing
-# Installed command:
-doc-layout-parser-viewer --enable-local-processing
+python viewer.py
+python viewer.py --read-only
+python main.py --markdown --skip-existing
 ```
 
 The folder picker is limited to the server process's working folder, home folder,
-and configured input/config locations. Processing is disabled by default and the
-option requires a loopback host; do not combine it with `--host 0.0.0.0` or expose
-it through a public/reverse-proxy endpoint. Select a config JSON or use built-in
+and configured input/output/config locations. Processing requires a loopback host;
+non-loopback hosts default to read-only. Do not expose processing controls
+through a public/reverse-proxy endpoint. Select a config JSON or use built-in
 defaults. Jobs use the viewer's selected output directory and run one at a time.
+
+Skip existing results checks the exact filename/path-hash output folder, even if
+incomplete; it does not add Markdown to skipped results or match legacy stem-only
+folders. Stop terminates the parser; completed files remain, but hidden staging
+or backup folders may remain if stopped during processing/publication. Follow the
+recovery notes in Output structure. Use one viewer/writer per input/output set.
 
 ### Server use
 

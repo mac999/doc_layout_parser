@@ -11,6 +11,8 @@ Usage:
 """
 import argparse
 import json
+import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -20,6 +22,7 @@ import webbrowser
 from pathlib import Path
 from threading import Timer
 
+import fitz
 from flask import Flask, Response, abort, jsonify, request, send_file
 from pipeline.config import load_config, preflight, resolve_config_path
 from pipeline.loader import IMAGE_EXTS
@@ -45,6 +48,8 @@ def create_app(
     initial_input = (input_root or (workspace_root / "input")).resolve()
     selected_config = config_path.resolve() if config_path else None
     jobs = {}
+    parser_processes = {}
+    cancel_requests = set()
     jobs_lock = threading.Lock()
 
     def local_processing_required():
@@ -58,6 +63,7 @@ def create_app(
             workspace_root,
             Path.home(),
             initial_input,
+          out_root,
             selected_config.parent if selected_config else workspace_root,
         )
         return tuple(dict.fromkeys(path.resolve() for path in roots))
@@ -70,47 +76,87 @@ def create_app(
             abort(403, "Path is outside the local workspace and home folders")
         return path
 
-    def run_parser(job_id: str, cfg: dict) -> None:
+    def run_parser(job_id: str, cfg: dict, markdown: bool, skip_existing: bool,
+             page_counts: dict[str, int]) -> None:
         config_file = None
+        output = ""
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".json", encoding="utf-8", delete=False
-            ) as stream:
-                json.dump(cfg, stream, ensure_ascii=False, indent=2)
-                config_file = Path(stream.name)
-            process = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-u",
-                    str(ROOT / "main.py"),
-                    "--config",
-                    str(config_file),
-                ],
-                cwd=workspace_root,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
-            output = ""
-            for line in process.stdout:
-                output = (output + line)[-12000:]
-                with jobs_lock:
-                    jobs[job_id]["log"] = output
-            returncode = process.wait()
+          with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", encoding="utf-8", delete=False
+          ) as stream:
+            json.dump(cfg, stream, ensure_ascii=False, indent=2)
+            config_file = Path(stream.name)
+          command = [sys.executable, "-u", str(ROOT / "main.py"), "--config", str(config_file)]
+          if markdown:
+            command.append("--markdown")
+          if skip_existing:
+            command.append("--skip-existing")
+          child_env = os.environ.copy()
+          child_env["PYTHONIOENCODING"] = "utf-8"
+          process = subprocess.Popen(
+            command,
+            cwd=workspace_root,
+            env=child_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+          )
+          with jobs_lock:
+            parser_processes[job_id] = process
+            stop_requested = job_id in cancel_requests
+          if stop_requested:
+            process.terminate()
+          suppress_warning_gap = False
+          for line in process.stdout:
+            stripped = line.strip()
+            if stripped == "MuPDF error: syntax error: unknown keyword: '0rg'":
+              suppress_warning_gap = True
+              continue
+            if not stripped and suppress_warning_gap:
+              continue
+            suppress_warning_gap = False
+            output = (output + line)[-12000:]
             with jobs_lock:
-                jobs[job_id].update(
-                    status="complete" if returncode == 0 else "failed",
-                    returncode=returncode,
-                    log=output,
+              job = jobs[job_id]
+              progress = job["progress"]
+              if stripped.startswith("[SKIP] "):
+                name = stripped[len("[SKIP] "):].split(": output already exists", 1)[0]
+                progress["completed_pages"] = min(
+                    progress["total_pages"],
+                    progress["completed_pages"] + page_counts.get(name, 1),
                 )
+              elif stripped.startswith("=== ") and stripped.endswith(" ==="):
+                progress["current_file"] = stripped[4:-4]
+                progress["current_page"] = 0
+              else:
+                page_match = re.match(r"page (\d+):", stripped)
+                if page_match:
+                  progress["current_page"] = int(page_match.group(1))
+                  progress["completed_pages"] = min(
+                      progress["total_pages"], progress["completed_pages"] + 1
+                  )
+              job["log"] = output
+          returncode = process.wait()
+          with jobs_lock:
+            stopped = job_id in cancel_requests
+            status = "stopped" if stopped else "complete" if returncode == 0 else "failed"
+            if status == "complete":
+              jobs[job_id]["progress"]["completed_pages"] = jobs[job_id]["progress"]["total_pages"]
+            jobs[job_id].update(status=status, returncode=returncode, log=output)
         except Exception as error:
-            with jobs_lock:
-                jobs[job_id].update(status="failed", returncode=-1, log=str(error))
+          with jobs_lock:
+            stopped = job_id in cancel_requests
+            jobs[job_id].update(
+              status="stopped" if stopped else "failed", returncode=-1, log=str(error)
+            )
         finally:
-            if config_file:
-                config_file.unlink(missing_ok=True)
+          with jobs_lock:
+            parser_processes.pop(job_id, None)
+            cancel_requests.discard(job_id)
+          if config_file:
+            config_file.unlink(missing_ok=True)
 
     def safe_path(rel: str) -> Path:
         path = (out_root / rel).resolve()
@@ -156,6 +202,7 @@ def create_app(
                             {
                                 "name": directory.name,
                                 **result,
+                                "has_markdown": (directory / "document.md").is_file(),
                                 "status": (
                                     "incomplete"
                                     if missing
@@ -187,12 +234,16 @@ def create_app(
     @app.get("/api/local/settings")
     def api_local_settings():
         local_processing_required()
+        with jobs_lock:
+            active_job = next((dict(job) for job in jobs.values()
+                               if job["status"] in {"running", "stopping"}), None)
         return jsonify(
             {
                 "input_dir": str(initial_input),
                 "config_path": str(selected_config) if selected_config else "",
                 "roots": [str(root) for root in allowed_roots()],
                 "output_dir": str(out_root),
+                "active_job": active_job,
             }
         )
 
@@ -200,8 +251,8 @@ def create_app(
     def api_local_browse():
         local_processing_required()
         mode = request.args.get("mode", "input")
-        if mode not in {"input", "config"}:
-            abort(400, "mode must be input or config")
+        if mode not in {"input", "output", "config"}:
+          abort(400, "mode must be input, output or config")
         path = local_path(request.args.get("path", str(workspace_root)))
         if not path.is_dir():
             abort(400, "Selected path is not a directory")
@@ -252,6 +303,7 @@ def create_app(
 
     @app.post("/api/local/process")
     def api_local_process():
+        nonlocal out_root
         local_processing_required()
         body = request.get_json(silent=True) or {}
         input_value = body.get("input_dir")
@@ -260,8 +312,21 @@ def create_app(
         input_dir = local_path(input_value)
         if not input_dir.is_dir():
             abort(400, "Input folder does not exist")
+        output_value = body.get("output_dir", str(out_root))
+        if not isinstance(output_value, str) or not output_value.strip():
+            abort(400, "Output folder is required")
+        output_dir = local_path(output_value)
+        if output_dir.exists() and not output_dir.is_dir():
+          abort(400, "Output path is not a directory")
+        markdown = body.get("markdown", True)
+        if type(markdown) is not bool:
+            abort(400, "Markdown option must be a boolean")
+        skip_existing = body.get("skip_existing", False)
+        if type(skip_existing) is not bool:
+          abort(400, "Skip-existing option must be a boolean")
         config_value = str(body.get("config_path", "")).strip()
-        chosen_config = local_path(config_value) if config_value else selected_config
+        chosen_config = local_path(config_value) if config_value else (
+          None if "config_path" in body else selected_config)
         if chosen_config and (
             chosen_config.suffix.lower() != ".json" or not chosen_config.is_file()
         ):
@@ -274,28 +339,74 @@ def create_app(
                 if path.is_file() and path.suffix.lower() in IMAGE_EXTS | {".pdf"}
             )
             cfg["input_dir"] = str(input_dir)
-            cfg["output_dir"] = str(out_root)
+            cfg["output_dir"] = str(output_dir)
             cfg, _ = preflight(cfg, files)
         except (OSError, ValueError, RuntimeError) as error:
             abort(400, str(error))
+        page_counts = {}
+        for path in files:
+            try:
+                if path.suffix.lower() == ".pdf":
+                    with fitz.open(path) as document:
+                        page_counts[path.name] = max(1, document.page_count)
+                else:
+                    page_counts[path.name] = 1
+            except Exception:
+                page_counts[path.name] = 1
+        total_pages = max(1, sum(page_counts.values()))
         with jobs_lock:
-            if any(job["status"] == "running" for job in jobs.values()):
+            if any(job["status"] in {"running", "stopping"} for job in jobs.values()):
                 abort(409, "A parsing job is already running")
             for finished_id in list(jobs)[:-25]:
-                if jobs[finished_id]["status"] != "running":
+              if jobs[finished_id]["status"] not in {"running", "stopping"}:
                     jobs.pop(finished_id)
             job_id = uuid.uuid4().hex
             jobs[job_id] = {
                 "id": job_id,
                 "status": "running",
                 "input_dir": str(input_dir),
+                "output_dir": str(output_dir),
+                "markdown": markdown,
+                "skip_existing": skip_existing,
                 "config_path": (
                     str(chosen_config) if chosen_config else "built-in defaults"
                 ),
+                "progress": {
+                  "completed_pages": 0,
+                  "total_pages": total_pages,
+                  "current_file": "",
+                  "current_page": 0,
+                },
                 "log": "Starting parser...",
             }
-        threading.Thread(target=run_parser, args=(job_id, cfg), daemon=True).start()
+            out_root = output_dir
+            threading.Thread(
+              target=run_parser,
+              args=(job_id, cfg, markdown, skip_existing, page_counts),
+              daemon=True,
+            ).start()
         return jsonify(jobs[job_id]), 202
+
+    @app.post("/api/local/jobs/<job_id>/stop")
+    def api_local_stop(job_id: str):
+        local_processing_required()
+        with jobs_lock:
+            job = jobs.get(job_id)
+            if job is None:
+                abort(404)
+            if job["status"] not in {"running", "stopping"}:
+                return jsonify(job)
+            process = parser_processes.get(job_id)
+            if process is not None and process.poll() is not None:
+                return jsonify(job)
+            cancel_requests.add(job_id)
+            job["status"] = "stopping"
+            if process is not None:
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+            return jsonify(job), 202
 
     @app.get("/api/local/jobs/<job_id>")
     def api_local_job(job_id: str):
@@ -325,7 +436,9 @@ def create_app(
 
     @app.get("/files/<path:rel>")
     def files(rel: str):
-        return send_file(safe_path(rel))
+      path = safe_path(rel)
+      options = {"mimetype": "text/markdown; charset=utf-8"} if path.suffix.lower() == ".md" else {}
+      return send_file(path, as_attachment=request.args.get("download") == "1", **options)
 
     return app
 
@@ -350,7 +463,11 @@ PAGE = r"""<!doctype html>
 html,body{height:100%}
 body{font:var(--font); background:var(--bg); color:var(--fg); overflow:hidden}
 #app{display:grid; grid-template-columns:var(--w-side,250px) 5px minmax(0,1fr) 5px var(--w-detail,340px);
-  grid-template-rows:100vh}
+  grid-template-rows:auto minmax(0,1fr); height:100dvh}
+#topbar{grid-column:1/-1; display:flex; flex-wrap:wrap; align-items:center; gap:8px 16px;
+  padding:8px 12px; border-bottom:1px solid var(--border); background:var(--panel)}
+#viewerTitle{font-size:14px; font-weight:600; letter-spacing:0; white-space:nowrap}
+#viewerTitle span{color:var(--accent)}
 
 /* ---------- splitters ---------- */
 .vsplit{background:var(--border); cursor:col-resize; position:relative; z-index:5; transition:background .12s}
@@ -364,22 +481,45 @@ body.resizing-v{cursor:row-resize; user-select:none}
 body.resizing iframe, body.resizing img, body.resizing-v img{pointer-events:none}
 
 /* ---------- sidebar ---------- */
-#side{background:var(--panel); border-right:1px solid var(--border); display:flex; flex-direction:column; min-width:0}
-#side h1{font-size:14px; font-weight:600; padding:14px 16px 4px; letter-spacing:.2px}
-#side h1 span{color:var(--accent)}
-.language-switch{display:flex; gap:4px; margin:4px 16px 8px; align-self:flex-start}
-.language-switch button{min-width:64px}
+#side{background:var(--panel); border-right:1px solid var(--border); display:flex; flex-direction:column; min-width:0; min-height:0}
+#languageToggle{width:42px; height:30px; flex:none; margin-left:auto; padding:0;
+  border:1px solid var(--border); background:var(--panel2)}
 #side .sub{padding:0 16px 10px; color:var(--fg-dim); font-size:11px; border-bottom:1px solid var(--border);
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
-#processPanel{padding:6px 10px 8px; border-bottom:1px solid var(--border); display:grid; gap:5px}
+#processPanel{flex:1 1 740px; min-width:0; display:flex; flex-wrap:wrap; align-items:center; gap:8px}
+#processPanel .path-pick{width:auto; flex:1 1 180px; min-width:120px; max-width:300px}
+#processOptions{display:flex; flex-wrap:wrap; gap:10px; align-items:center; font-size:12px}
+#processOptions label{display:flex; gap:5px; align-items:center; cursor:pointer}
+#processLogPanel{padding:8px; display:flex; flex-direction:column; flex:none; gap:4px;
+  height:clamp(72px,var(--h-log,var(--h-log-default,182px)),calc(100% - 105px)); min-height:0}
+#processLogPanel[hidden]{display:none}
+#splitLog{display:block; touch-action:none}
+#splitLog[hidden]{display:none}
+#splitLog:focus-visible{outline:2px solid var(--accent); outline-offset:-2px; background:var(--accent)}
+#processPanel button:disabled{opacity:.5; cursor:default}
 .path-pick{display:flex; align-items:center; gap:6px; min-width:0; width:100%; border:1px solid var(--border);
   border-radius:6px; background:var(--panel2); color:var(--fg); padding:5px 7px; cursor:pointer; text-align:left}
 .path-pick:hover{border-color:var(--accent)}
 .path-pick strong{font-size:11px; white-space:nowrap}
 .path-pick span{font-size:10px; color:var(--fg-dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
 #processActions{display:flex; align-items:center; gap:6px}
-#processButton{background:var(--accent-dim); color:var(--fg)}
-#processStatus{font-size:10px; color:var(--fg-dim); overflow-wrap:anywhere; max-height:56px; overflow:auto; white-space:pre-wrap}
+#processButton{background:var(--accent-dim); color:var(--fg); min-width:92px; height:30px}
+#processButton[data-active="true"]{background:#773338; color:#fff}
+#processSummary{font-size:11px; overflow-wrap:anywhere}
+#processLogHeading{font-size:10px; color:var(--fg-dim)}
+#processProgress{display:flex; align-items:center; gap:8px; min-height:14px}
+#processProgress[hidden]{display:none}
+#processProgressTrack{position:relative; flex:1; height:5px; overflow:hidden; border-radius:99px; background:var(--border)}
+#processProgressFill{height:100%; width:0; border-radius:inherit; background:var(--accent); transition:width .2s ease}
+#processProgressTrack::after{position:absolute; inset:0 auto 0 -35%; width:35%; content:""; opacity:0;
+  background:linear-gradient(90deg,transparent,#ffffff70,transparent)}
+#processProgressTrack[data-active="true"]::after{opacity:1; animation:progressSweep 1.3s ease-in-out infinite}
+@keyframes progressSweep{to{transform:translateX(390%)}}
+#processProgressLabel{min-width:92px; color:var(--fg-dim); font-size:10px; text-align:right; white-space:nowrap}
+@media(prefers-reduced-motion:reduce){#processProgressFill{transition:none}#processProgressTrack[data-active="true"]::after{animation:none; left:65%}}
+#processStatus{font-size:11px; color:var(--fg-dim); overflow-wrap:anywhere; flex:1; min-height:0;
+  overflow:auto; white-space:pre-wrap; padding:4px 6px; border:1px solid var(--border); border-radius:4px; background:var(--panel2)}
+#processStatus:empty::before{content:attr(data-empty)}
 #picker{position:fixed; z-index:20; inset:0; display:flex; align-items:center; justify-content:center; padding:16px;
   background:#0009}
 #picker[hidden],#processPanel[hidden]{display:none}
@@ -394,7 +534,7 @@ body.resizing iframe, body.resizing img, body.resizing-v img{pointer-events:none
   border:0; border-radius:5px; text-align:left; cursor:pointer; font:inherit}
 .picker-entry:hover{background:var(--panel2)}
 #pickerFoot{padding:10px 12px; border-top:1px solid var(--border); display:flex; justify-content:flex-end; gap:6px}
-#fileList{overflow-y:auto; flex:1; padding:8px}
+#fileList{overflow-y:auto; flex:1; min-height:0; padding:8px}
 .fitem{border-radius:var(--radius); margin-bottom:2px}
 .fitem>.fhead{display:flex; align-items:center; gap:8px; padding:7px 10px; cursor:pointer; border-radius:var(--radius)}
 .fitem>.fhead:hover{background:var(--panel2)}
@@ -412,11 +552,34 @@ body.resizing iframe, body.resizing img, body.resizing-v img{pointer-events:none
 .pitem .rc{margin-left:auto; font-size:10px; color:var(--fg-dim)}
 
 /* ---------- main ---------- */
-#main{display:flex; flex-direction:column; min-width:0; background:var(--bg)}
+#main{display:flex; flex-direction:column; min-width:0; min-height:0; background:var(--bg)}
 #toolbar{display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:8px 14px;
   background:var(--panel); border-bottom:1px solid var(--border)}
 #crumb{font-size:12px; color:var(--fg-dim); margin-right:auto; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
 #crumb b{color:var(--fg); font-weight:600}
+#markdownLink{text-decoration:none}
+#typeChips{display:flex; gap:5px}
+#markdownView{flex:1; min-height:0; display:flex; flex-direction:column; background:var(--panel)}
+#markdownView[hidden],#canvasWrap[hidden],#toolbar [hidden]{display:none}
+#markdownHeader{display:flex; align-items:center; gap:8px; padding:8px 14px; border-bottom:1px solid var(--border)}
+#markdownName{flex:1; min-width:0; overflow-wrap:anywhere; font-size:12px; color:var(--fg-dim)}
+#markdownModes{display:flex; gap:2px; padding:2px; border:1px solid var(--border); border-radius:6px; background:var(--panel2)}
+#markdownModes .tbtn{padding:3px 8px}
+#markdownDownload{display:flex; align-items:center; justify-content:center; width:30px; height:30px;
+  border:1px solid var(--border); text-decoration:none; font-size:18px}
+#markdownContent{flex:1; min-height:0; padding:18px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere;
+  font:13px/1.7 Consolas,"Malgun Gothic",monospace; tab-size:4; color:var(--fg)}
+#markdownRendered{flex:1; min-height:0; padding:18px; overflow:auto; overflow-wrap:anywhere; line-height:1.7}
+#markdownRendered[hidden],#markdownContent[hidden]{display:none}
+#markdownRendered h1,#markdownRendered h2,#markdownRendered h3,#markdownRendered h4,#markdownRendered h5,#markdownRendered h6{margin:1em 0 .55em; line-height:1.35}
+#markdownRendered h1:first-child,#markdownRendered h2:first-child{margin-top:0}
+#markdownRendered p{margin:0 0 1em}
+#markdownRendered table{border-collapse:collapse; margin:0 0 1em; max-width:100%; display:block; overflow:auto}
+#markdownRendered th,#markdownRendered td{padding:5px 9px; border:1px solid var(--border); text-align:left; white-space:pre-wrap}
+#markdownRendered th{background:var(--panel2); color:var(--fg)}
+#markdownRendered hr{border:0; border-top:1px solid var(--border); margin:1em 0}
+.mditem{padding-left:28px}
+.markdown-file{flex:none; border:1px solid var(--border); font-size:10px; padding:2px 5px}
 .tgroup{display:flex; align-items:center; gap:4px; background:var(--panel2); border:1px solid var(--border);
   border-radius:8px; padding:3px}
 .tbtn{border:0; background:transparent; color:var(--fg-dim); font:inherit; font-size:12px;
@@ -495,18 +658,23 @@ body.resizing iframe, body.resizing img, body.resizing-v img{pointer-events:none
 ::-webkit-scrollbar{width:10px; height:10px}
 ::-webkit-scrollbar-thumb{background:#2a3040; border-radius:5px; border:2px solid var(--panel)}
 ::-webkit-scrollbar-track{background:transparent}
+@media(max-width:1100px){
+  #topbar{display:grid; grid-template-columns:minmax(0,1fr) auto}
+  #processPanel{grid-column:1/-1; grid-row:2}
+  #languageToggle{grid-column:2; grid-row:1}
+}
 @media(max-width:800px){
   body{overflow:auto}
-  #app{grid-template-columns:minmax(0,1fr); grid-template-rows:190px minmax(300px,1fr) 300px;
-    height:100dvh; min-height:790px}
+  #app{grid-template-columns:minmax(0,1fr); grid-template-rows:auto 300px 480px 320px;
+    height:auto; min-height:100dvh}
   .vsplit{display:none}
   #side,#detail{min-height:0}
-  #side h1{padding-top:6px}
   #side .sub{display:none}
-  .language-switch{margin-bottom:2px}
-  #processPanel{padding:3px 8px 5px; gap:3px}
+  #topbar{padding:6px 8px; gap:6px 10px}
+  #processPanel{gap:5px}
+  #processLogPanel{--h-log-default:120px}
   .path-pick{padding:3px 6px}
-  #processStatus{max-height:30px}
+  #processStatus{padding:4px 5px}
   #toolbar{gap:5px; padding:6px}
   #crumb{flex-basis:100%}
 }
@@ -514,21 +682,36 @@ body.resizing iframe, body.resizing img, body.resizing-v img{pointer-events:none
 </head>
 <body>
 <div id="app">
+  <header id="topbar">
+    <h1 id="viewerTitle">Doc Layout Parser <span>Viewer</span></h1>
+  <nav id="processPanel" aria-label="Processing" hidden>
+    <button class="path-pick" id="inputPathButton" type="button"><strong id="inputPathLabel">입력</strong><span id="inputPath"></span></button>
+    <button class="path-pick" id="outputPathButton" type="button"><strong id="outputPathLabel">출력</strong><span id="outputPath"></span></button>
+    <button class="path-pick" id="configPathButton" type="button"><strong id="configPathLabel">설정</strong><span id="configPath"></span></button>
+    <div id="processOptions">
+      <label><input id="markdownOption" type="checkbox" checked><span id="markdownOptionLabel">Markdown 생성</span></label>
+      <label><input id="skipExistingOption" type="checkbox"><span id="skipExistingLabel">기존 결과 건너뛰기</span></label>
+    </div>
+    <div id="processActions">
+      <button class="tbtn" id="processButton" type="button">처리</button>
+      <span id="processSummary" role="status" aria-live="polite"></span>
+    </div>
+  </nav>
+    <button class="tbtn" id="languageToggle" type="button" aria-label="Switch to English" title="Switch to English">EN</button>
+  </header>
   <aside id="side">
-    <h1>Doc Layout Parser <span>Viewer</span></h1>
-    <div class="tgroup language-switch" role="group" aria-label="Language">
-      <button class="tbtn" data-lang="ko" lang="ko">한국어</button>
-      <button class="tbtn" data-lang="en" lang="en">English</button>
-    </div>
-    <div id="processPanel" hidden>
-      <button class="path-pick" id="inputPathButton" type="button"><strong id="inputPathLabel">입력</strong><span id="inputPath"></span></button>
-      <button class="path-pick" id="configPathButton" type="button"><strong id="configPathLabel">설정</strong><span id="configPath"></span></button>
-      <div id="processActions">
-        <button class="tbtn" id="processButton" type="button">처리</button>
-        <span id="processSummary"></span>
+    <div id="processLogPanel" hidden>
+      <div id="processLogHeading">처리 로그</div>
+      <div id="processProgress" hidden>
+        <div id="processProgressTrack" role="progressbar" aria-label="처리 진행률" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div id="processProgressFill"></div>
+        </div>
+        <span id="processProgressLabel"></span>
       </div>
-      <pre id="processStatus" role="status" aria-live="polite"></pre>
+      <pre id="processStatus" data-empty="로그가 아직 없습니다." role="status" aria-live="polite"></pre>
     </div>
+    <div class="hsplit" id="splitLog" role="separator" tabindex="0" aria-orientation="horizontal"
+      aria-controls="processLogPanel" aria-label="처리 로그" hidden></div>
     <div class="sub" id="outdir"></div>
     <div id="fileList"></div>
   </aside>
@@ -538,17 +721,21 @@ body.resizing iframe, body.resizing img, body.resizing-v img{pointer-events:none
   <section id="main">
     <div id="toolbar">
       <div id="crumb">파일을 선택하세요</div>
+      <div class="tgroup" role="tablist" aria-label="Document view">
+        <button class="tbtn on" id="documentTab" type="button" role="tab" aria-selected="true" aria-controls="canvasWrap">문서</button>
+        <button class="tbtn" id="markdownLink" type="button" role="tab" aria-selected="false" aria-controls="markdownView" disabled>Markdown</button>
+      </div>
       <div class="tgroup" id="baseGroup">
         <button class="tbtn on" data-base="page">원본</button>
         <button class="tbtn" data-base="overlay">오버레이</button>
       </div>
-      <div class="tgroup">
+      <div class="tgroup" id="layerGroup">
         <button class="tbtn on" id="lyBbox">영역 박스</button>
         <button class="tbtn" id="lyVec">벡터</button>
         <button class="tbtn" id="lyNative" style="display:none">PDF 벡터</button>
       </div>
-      <div id="typeChips" style="display:flex; gap:5px"></div>
-      <div class="tgroup">
+      <div id="typeChips"></div>
+      <div class="tgroup" id="zoomGroup">
         <button class="tbtn" id="zoomFit" title="화면 맞춤">맞춤</button>
         <button class="tbtn" id="zoom100" title="100%">1:1</button>
       </div>
@@ -561,6 +748,17 @@ body.resizing iframe, body.resizing img, body.resizing-v img{pointer-events:none
       <div id="empty"><div style="font-size:32px">📐</div><div>왼쪽에서 파일과 페이지를 선택하세요</div></div>
       <div id="hud" style="display:none"></div>
     </div>
+    <section id="markdownView" role="tabpanel" aria-labelledby="markdownLink" hidden>
+      <div id="markdownHeader"><span id="markdownName">document.md</span>
+        <div id="markdownModes" role="group" aria-label="Markdown 표시 방식">
+          <button class="tbtn on" id="markdownRenderedMode" type="button" aria-pressed="true">렌더링</button>
+          <button class="tbtn" id="markdownTextMode" type="button" aria-pressed="false">텍스트</button>
+        </div>
+        <a class="tbtn" id="markdownDownload" download="document.md" aria-label="Markdown 다운로드" title="Markdown 다운로드">&#8595;</a>
+      </div>
+      <article id="markdownRendered" tabindex="0"></article>
+      <pre id="markdownContent" tabindex="0"></pre>
+    </section>
   </section>
 
   <div class="vsplit" id="splitR" title="드래그로 크기 조절, 더블클릭으로 초기화"></div>
@@ -589,6 +787,10 @@ const TYPE_LABELS = {text:"텍스트", dimension:"치수", annotation:"주석", 
 const EN = {
   "텍스트":"Text", "치수":"Dimension", "주석":"Annotation", "도면":"Drawing", "이미지":"Image", "표":"Table",
   "레이아웃 영역":"Layout Regions", "파일을 선택하세요":"Select a file", "원본":"Original", "오버레이":"Overlay",
+  "Markdown 문서 열기":"Open Markdown document",
+  "문서":"Document", "Markdown 다운로드":"Download Markdown", "Markdown 파일이 없습니다":"No Markdown file available",
+  "렌더링":"Rendered", "텍스트":"Text", "Markdown 표시 방식":"Markdown display mode",
+  "Markdown 불러오는 중…":"Loading Markdown…",
   "영역 박스":"Boxes", "벡터":"Vectors", "PDF 벡터":"PDF Vectors", "맞춤":"Fit", "화면 맞춤":"Fit to canvas",
   "드래그로 크기 조절, 더블클릭으로 초기화":"Drag to resize; double-click to reset",
   "선택 {id}":"Selected {id}", "파싱 결과가 없습니다.":"No parsed results.", "페이지 {number}":"Page {number}",
@@ -603,6 +805,12 @@ const EN = {
   "처리 중":"Running", "소속 / 의미":"Context / meaning", "표 내부":"In table", "도면 내부":"In drawing",
   "지표":"Metrics", "성공":"OK", "생략":"Skipped",
   "입력":"Input", "설정":"Config", "처리":"Process", "처리 중":"Processing",
+  "출력":"Output", "출력 폴더 선택":"Select output folder", "처리 로그":"Processing log",
+  "로그가 아직 없습니다.":"No processing log yet.",
+  "처리 진행률":"Processing progress", "페이지 수 계산 중":"Counting pages...",
+  "페이지 {completed}/{total}":"Page {completed}/{total}",
+  "Markdown 생성":"Generate Markdown", "기존 결과 건너뛰기":"Skip existing results",
+  "멈춤":"Stop", "중지 중":"Stopping", "중지됨":"Stopped", "시작 중":"Starting",
   "완료":"Complete", "실패":"Failed", "입력 폴더 선택":"Select input folder",
   "설정 파일 선택":"Select config file", "현재 폴더 선택":"Use this folder",
   "설정 파일 선택 해제":"Use built-in defaults", "폴더를 선택하세요":"Choose a folder",
@@ -612,7 +820,8 @@ const EN = {
   "현재 폴더":"Current folder", "로컬 입력 처리":"Local input processing", "기본 설정":"Built-in defaults"
 };
 const STATUS_LABELS = {failed:"실패", complete:"완료", incomplete:"불완전", legacy:"이전 형식", unreadable:"읽기 오류",
-  running:"처리 중", ok:"성공", skipped:"생략", in_table:"표 내부", in_drawing:"도면 내부"};
+  running:"처리 중", stopping:"중지 중", stopped:"중지됨", starting:"시작 중",
+  ok:"성공", skipped:"생략", in_table:"표 내부", in_drawing:"도면 내부"};
 let language = "ko";
 try{ if(localStorage.getItem("viewerLanguage") === "en") language = "en"; }catch(error){}
 function tr(text, values={}){
@@ -630,6 +839,8 @@ const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;
 const enc = encodeURIComponent;
 
 const state = {
+  documentView: "page",
+  markdownMode: "rendered", markdownText: "",
   files: [], file: null, page: null, layout: null, selId: null,
   base: "page", layers: {bbox:true, vec:false, native:false},
   types: {text:true, dimension:true, annotation:true, drawing:true, image:true, table:true},
@@ -646,15 +857,26 @@ function setLanguage(value){
   language = value;
   try{ localStorage.setItem("viewerLanguage", value); }catch(error){}
   document.documentElement.lang = value;
-  document.querySelectorAll("[data-lang]").forEach(button => {
-    button.classList.toggle("on", button.dataset.lang === value);
-    button.setAttribute("aria-pressed", String(button.dataset.lang === value));
-  });
+  const languageButton = $("#languageToggle");
+  languageButton.textContent = value === "ko" ? "EN" : "한";
+  languageButton.lang = value === "ko" ? "en" : "ko";
+  languageButton.title = value === "ko" ? "Switch to English" : "한국어로 전환";
+  languageButton.setAttribute("aria-label", languageButton.title);
+  $("#markdownDownload").title = tr("Markdown 다운로드");
+  $("#markdownDownload").setAttribute("aria-label", tr("Markdown 다운로드"));
+  $("#markdownModes").setAttribute("aria-label", tr("Markdown 표시 방식"));
+  $("#markdownRenderedMode").textContent = tr("렌더링");
+  $("#markdownTextMode").textContent = tr("텍스트");
+  $("#markdownLink").title = tr($("#markdownLink").disabled ? "Markdown 파일이 없습니다" : "Markdown 문서 열기");
   for(const [selector,text] of Object.entries({
-    '#regionHeading':"레이아웃 영역",'[data-base="page"]':"원본",'[data-base="overlay"]':"오버레이",
+    '#documentTab':"문서", '#regionHeading':"레이아웃 영역",'[data-base="page"]':"원본",'[data-base="overlay"]':"오버레이",
     '#lyBbox':"영역 박스",'#lyVec':"벡터",'#lyNative':"PDF 벡터",'#zoomFit':"맞춤",
-    '#inputPathLabel':"입력",'#configPathLabel':"설정",'#processButton':"처리"
+    '#inputPathLabel':"입력",'#outputPathLabel':"출력",'#configPathLabel':"설정",'#processButton':"처리",
+    '#processLogHeading':"처리 로그", '#markdownOptionLabel':"Markdown 생성", '#skipExistingLabel':"기존 결과 건너뛰기"
   })) $(selector).textContent = tr(text);
+  renderProcessingControls();
+  $("#processStatus").dataset.empty = tr("로그가 아직 없습니다.");
+  $("#splitLog").setAttribute("aria-label", tr("처리 로그"));
   $("#zoomFit").title = tr("화면 맞춤");
   $("#rlist").setAttribute("aria-label", tr("레이아웃 영역"));
   $("#empty").textContent = tr("파일을 선택하세요");
@@ -664,30 +886,175 @@ function setLanguage(value){
   buildTypeChips(); renderRegions(); renderList(); updateSelectionLabel();
   if(state.selId && $("#rdetail").classList.contains("show")) selectRegion(state.selId);
 }
-document.querySelectorAll("[data-lang]").forEach(button => button.onclick = () => setLanguage(button.dataset.lang));
+$("#languageToggle").onclick = () => setLanguage(language === "ko" ? "en" : "ko");
+function setDocumentView(view){
+  state.documentView = view;
+  const markdown = view === "markdown";
+  $("#canvasWrap").hidden = markdown;
+  $("#markdownView").hidden = !markdown;
+  for(const id of ["baseGroup", "layerGroup", "typeChips", "zoomGroup"]) $("#" + id).hidden = markdown;
+  $("#documentTab").classList.toggle("on", !markdown);
+  $("#documentTab").setAttribute("aria-selected", String(!markdown));
+  $("#markdownLink").classList.toggle("on", markdown);
+  $("#markdownLink").setAttribute("aria-selected", String(markdown));
+  if(!markdown && state.layout) requestAnimationFrame(fitView);
+}
+async function openMarkdown(file = state.file){
+  const info = state.files.find(item => item.name === file);
+  if(!info?.has_markdown) return;
+  setDocumentView("markdown");
+  $("#markdownName").textContent = `${info.source_file || file} / document.md`;
+  $("#markdownDownload").href = fileUrl(`${file}/document.md`) + "?download=1";
+  $("#markdownContent").textContent = tr("Markdown 불러오는 중…");
+  try{
+    const response = await fetch(fileUrl(`${file}/document.md`));
+    if(!response.ok) throw new Error(`HTTP ${response.status}`);
+    const text = new TextDecoder("utf-8").decode(await response.arrayBuffer());
+    if(state.file === file){
+      state.markdownText = text;
+      $("#markdownContent").textContent = text;
+      renderMarkdown(text);
+      setMarkdownMode(state.markdownMode);
+    }
+  }catch(error){
+    if(state.file === file) $("#markdownContent").textContent = tr("로드 실패: {error}", {error:error.message});
+  }
+}
+function markdownCells(line){
+  let value = line.trim();
+  if(value.startsWith("|")) value = value.slice(1);
+  if(value.endsWith("|")) value = value.slice(0, -1);
+  const cells = []; let cell = "", escaped = false;
+  for(const char of value){
+    if(char === "|" && !escaped){ cells.push(cell.trim()); cell = ""; }
+    else if(char === "\\" && !escaped) escaped = true;
+    else { cell += char; escaped = false; }
+  }
+  cells.push(cell.trim());
+  return cells;
+}
+function renderMarkdown(text){
+  const target = $("#markdownRendered");
+  target.replaceChildren();
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  const isTableRule = line => /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(line);
+  for(let index = 0; index < lines.length;){
+    const line = lines[index];
+    if(!line.trim()){ index++; continue; }
+    const heading = line.match(/^(#{1,6})\s+(.+)$/);
+    if(heading){
+      const node = document.createElement(`h${heading[1].length}`);
+      node.textContent = heading[2]; target.appendChild(node); index++; continue;
+    }
+    if(index + 1 < lines.length && line.includes("|") && isTableRule(lines[index + 1])){
+      const table = document.createElement("table"), head = table.createTHead().insertRow();
+      for(const value of markdownCells(line)){ const cell = document.createElement("th"); cell.textContent = value; head.appendChild(cell); }
+      const body = table.createTBody(); index += 2;
+      while(index < lines.length && lines[index].trim() && lines[index].includes("|")){
+        const row = body.insertRow();
+        for(const value of markdownCells(lines[index])){ const cell = row.insertCell(); cell.textContent = value; }
+        index++;
+      }
+      target.appendChild(table); continue;
+    }
+    if(/^\s*([-*_])\1\1+\s*$/.test(line)){ target.appendChild(document.createElement("hr")); index++; continue; }
+    const paragraph = document.createElement("p"), parts = [];
+    while(index < lines.length && lines[index].trim() && !/^(#{1,6})\s+/.test(lines[index])){
+      if(index + 1 < lines.length && lines[index].includes("|") && isTableRule(lines[index + 1])) break;
+      parts.push(lines[index].trim()); index++;
+    }
+    paragraph.textContent = parts.join(" ");
+    if(paragraph.textContent) target.appendChild(paragraph);
+  }
+}
+function setMarkdownMode(mode){
+  state.markdownMode = mode === "text" ? "text" : "rendered";
+  const rendered = state.markdownMode === "rendered";
+  $("#markdownRendered").hidden = !rendered;
+  $("#markdownContent").hidden = rendered;
+  $("#markdownRenderedMode").classList.toggle("on", rendered);
+  $("#markdownRenderedMode").setAttribute("aria-pressed", String(rendered));
+  $("#markdownTextMode").classList.toggle("on", !rendered);
+  $("#markdownTextMode").setAttribute("aria-pressed", String(!rendered));
+}
+$("#markdownRenderedMode").onclick = () => setMarkdownMode("rendered");
+$("#markdownTextMode").onclick = () => setMarkdownMode("text");
+$("#documentTab").onclick = () => setDocumentView("page");
+$("#markdownLink").onclick = () => openMarkdown();
 
 async function jget(url){ const r = await fetch(url); if(!r.ok) throw new Error(url+" -> "+r.status); return r.json(); }
 const fileUrl = rel => "/files/" + rel.split("/").map(enc).join("/");
 
-const processing = {settings:null, mode:"input", currentPath:"", configChoice:""};
+const processing = {settings:null, mode:"input", currentPath:"", configChoice:"", jobId:null, status:"", progress:null, timer:null};
+function renderProcessingControls(){
+  const active = ["starting", "running", "stopping"].includes(processing.status);
+  const button = $("#processButton");
+  button.textContent = tr(processing.status === "stopping" ? "중지 중" : processing.jobId ? "멈춤" : "처리");
+  button.dataset.active = String(active);
+  button.disabled = processing.status === "starting" || processing.status === "stopping";
+  $("#processSummary").textContent = processing.status ? statusLabel(processing.status) : "";
+  document.querySelectorAll("#processPanel .path-pick, #processOptions input").forEach(control => control.disabled = active);
+  renderProcessingProgress();
+}
+function renderProcessingProgress(){
+  const row = $("#processProgress");
+  const progress = processing.progress;
+  const active = ["starting", "running", "stopping"].includes(processing.status);
+  if(!progress && !active){ row.hidden = true; return; }
+  row.hidden = false;
+  const completed = Math.max(0, Number(progress?.completed_pages) || 0);
+  const total = Math.max(0, Number(progress?.total_pages) || 0);
+  const percent = total ? Math.min(100, Math.round(completed * 100 / total)) : 0;
+  const track = $("#processProgressTrack");
+  track.dataset.active = String(active);
+  track.setAttribute("aria-label", tr("처리 진행률"));
+  track.setAttribute("aria-valuenow", String(percent));
+  const state = processing.status === "complete" ? tr("완료") :
+    processing.status === "failed" ? tr("실패") :
+    processing.status === "stopped" ? tr("중지됨") : tr("처리 중");
+  const detail = total ? tr("페이지 {completed}/{total}", {completed, total}) : tr("페이지 수 계산 중");
+  const label = total ? `${state} · ${detail}` : detail;
+  track.setAttribute("aria-valuetext", label);
+  $("#processProgressFill").style.width = `${percent}%`;
+  $("#processProgressLabel").textContent = label;
+}
 function showSelectedPaths(){
   $("#inputPath").textContent = processing.settings?.input_dir || "";
   $("#inputPath").title = processing.settings?.input_dir || "";
   const configPath = processing.settings?.config_path || tr("기본 설정");
   $("#configPath").textContent = configPath;
   $("#configPath").title = configPath;
+  $("#outputPath").textContent = processing.settings?.output_dir || "";
+  $("#outputPath").title = processing.settings?.output_dir || "";
 }
 async function initLocalProcessing(){
   try{
     processing.settings = await jget("/api/local/settings");
     $("#processPanel").hidden = false;
+    $("#processLogPanel").hidden = false;
+    $("#splitLog").hidden = false;
+    updateLogSplitter();
     showSelectedPaths();
     $("#inputPathButton").onclick = () => openPicker("input");
+    $("#outputPathButton").onclick = () => openPicker("output");
     $("#configPathButton").onclick = () => openPicker("config");
-    $("#processButton").onclick = startProcessing;
+    $("#processButton").onclick = () => processing.jobId ? stopProcessing() : startProcessing();
     $("#pickerClose").onclick = closePicker;
     $("#picker").addEventListener("click", event => { if(event.target.id === "picker") closePicker(); });
     $("#pickerChoose").onclick = choosePickerPath;
+    if(processing.settings.active_job){
+      const job = processing.settings.active_job;
+      Object.assign(processing.settings, {input_dir:job.input_dir, output_dir:job.output_dir,
+        config_path:job.config_path});
+      $("#markdownOption").checked = job.markdown;
+      $("#skipExistingOption").checked = job.skip_existing;
+      showSelectedPaths();
+      processing.jobId = job.id;
+      processing.status = job.status;
+      processing.progress = job.progress || null;
+      renderProcessingControls();
+      await pollProcessing(job.id);
+    }
   }catch(error){
     if(error.message.includes("404") || error.message.includes("403")) return;
     console.error("Local processing settings failed", error);
@@ -697,8 +1064,9 @@ function closePicker(){ $("#picker").hidden = true; }
 async function openPicker(mode){
   processing.mode = mode;
   processing.configChoice = "";
-  $("#pickerTitle").textContent = tr(mode === "input" ? "입력 폴더 선택" : "설정 파일 선택");
-  $("#pickerChoose").textContent = tr(mode === "input" ? "현재 폴더 선택" : "기본 설정");
+  const folderLabel = mode === "input" ? "입력" : "출력";
+  $("#pickerTitle").textContent = tr(mode === "config" ? "설정 파일 선택" : `${folderLabel} 폴더 선택`);
+  $("#pickerChoose").textContent = tr(mode === "config" ? "기본 설정" : "현재 폴더 선택");
   $("#picker").hidden = false;
   const roots = processing.settings.roots;
   const rootBox = $("#pickerRoots"); rootBox.innerHTML = "";
@@ -707,7 +1075,8 @@ async function openPicker(mode){
     button.onclick = () => browsePicker(root);
     rootBox.appendChild(button);
   }
-  const initial = mode === "input" ? processing.settings.input_dir :
+  const initial = mode === "input" ? processing.settings.input_dir : mode === "output" ?
+    processing.settings.output_dir :
     (processing.settings.config_path ? processing.settings.config_path.replace(/[\\/][^\\/]+$/, "") : roots[0]);
   try{ await browsePicker(initial); }
   catch(error){ $("#pickerList").textContent = `${tr("파일을 읽을 수 없습니다")}: ${error.message}`; }
@@ -735,34 +1104,72 @@ async function browsePicker(path){
 }
 function choosePickerPath(){
   if(processing.mode === "input") processing.settings.input_dir = processing.currentPath;
+  else if(processing.mode === "output") processing.settings.output_dir = processing.currentPath;
   else processing.settings.config_path = processing.configChoice;
   showSelectedPaths();
   closePicker();
 }
 async function startProcessing(){
-  const button = $("#processButton");
-  button.disabled = true;
-  $("#processSummary").textContent = tr("처리 중");
+  processing.status = "starting";
+  processing.progress = null;
+  renderProcessingControls();
   $("#processStatus").textContent = "";
   try{
     const response = await fetch("/api/local/process", {method:"POST", headers:{"Content-Type":"application/json"},
-      body:JSON.stringify(processing.settings)});
+      body:JSON.stringify({...processing.settings, markdown:$("#markdownOption").checked,
+        skip_existing:$("#skipExistingOption").checked})});
     const job = await response.json();
     if(!response.ok) throw new Error(job.message || job.error || `HTTP ${response.status}`);
+    processing.jobId = job.id;
+    processing.status = job.status;
+    processing.progress = job.progress || null;
+    renderProcessingControls();
     await pollProcessing(job.id);
   }catch(error){
-    $("#processSummary").textContent = tr("실패");
-    $("#processStatus").textContent = error.message;
-    button.disabled = false;
+    showProcessingError(error);
+  }
+}
+async function stopProcessing(){
+  const jobId = processing.jobId;
+  if(!jobId) return;
+  processing.status = "stopping";
+  renderProcessingControls();
+  try{
+    const response = await fetch(`/api/local/jobs/${enc(jobId)}/stop`, {method:"POST"});
+    if(!response.ok) throw new Error(`Stop failed: HTTP ${response.status}`);
+  }catch(error){
+    processing.status = "running";
+    $("#processStatus").textContent += `\n${error.message}`;
+    renderProcessingControls();
   }
 }
 async function pollProcessing(jobId){
-  const job = await jget(`/api/local/jobs/${enc(jobId)}`);
+  let job;
+  try{ job = await jget(`/api/local/jobs/${enc(jobId)}`); }
+  catch(error){
+    $("#processStatus").textContent += `\n${error.message}`;
+    processing.timer = setTimeout(() => pollProcessing(jobId), 1500);
+    return;
+  }
+  if(processing.jobId !== jobId) return;
+  processing.status = job.status;
+  processing.progress = job.progress || processing.progress;
   $("#processStatus").textContent = job.log || "";
-  if(job.status === "running") return setTimeout(() => pollProcessing(jobId).catch(showProcessingError), 900);
-  $("#processSummary").textContent = tr(job.status === "complete" ? "완료" : "실패");
-  $("#processButton").disabled = false;
-  if(job.status === "complete"){
+  $("#processStatus").scrollTop = $("#processStatus").scrollHeight;
+  if(["running", "stopping"].includes(job.status)){
+    renderProcessingControls();
+    processing.timer = setTimeout(() => pollProcessing(jobId), 900);
+    return;
+  }
+  processing.jobId = null;
+  renderProcessingControls();
+  try{
+    state.file = null; state.page = null; state.layout = null;
+    $("#stage").style.display = "none";
+    $("#markdownLink").disabled = true;
+    setDocumentView("page");
+    $("#empty").style.display = "flex";
+    renderList(); closeDetail();
     await loadFiles();
     const latest = [...state.files].sort((left,right) =>
       Date.parse(right.started_at || "") - Date.parse(left.started_at || ""))[0];
@@ -770,12 +1177,13 @@ async function pollProcessing(jobId){
       const firstPage = latest.pages.find(item => item.dir && item.status !== "failed");
       if(firstPage) await selectPage(latest.name, firstPage.dir);
     }
-  }
+  }catch(error){ $("#processStatus").textContent += `\n${error.message}`; }
 }
 function showProcessingError(error){
-  $("#processSummary").textContent = tr("실패");
+  processing.status = "failed";
+  processing.jobId = null;
   $("#processStatus").textContent = error.message;
-  $("#processButton").disabled = false;
+  renderProcessingControls();
 }
 
 /* ---------------- sidebar ---------------- */
@@ -805,8 +1213,29 @@ function renderFiles(){
   for(const f of state.files){
     const item = el("div", {class:"fitem" + (openFiles.has(f.name) || state.file === f.name ? " open" : ""), "data-file":f.name});
     const head = el("div", {class:"fhead"},
-      `<span class="arrow">▶</span><span class="name" title="${esc(f.source_file||f.name)}">${esc(f.name)}</span>
+      `<span class="arrow">▶</span><span class="name" title="${esc(f.name)}">${esc(f.source_file||f.name)}</span>
       <span class="cnt">${esc(statusLabel(f.error ? "unreadable" : f.status || "legacy"))} / ${f.num_pages ?? "?"}p</span>`);
+    if(f.has_markdown){
+      const markdownButton = el("button", {class:"tbtn markdown-file", type:"button", title:tr("Markdown 문서 열기"),
+        "aria-label":`${f.source_file || f.name}: ${tr("Markdown 문서 열기")}`}, "MD");
+      markdownButton.onclick = async event => {
+        event.stopPropagation();
+        const firstPage = f.pages?.find(page => page.dir && page.status !== "failed");
+        if(firstPage){
+          await selectPage(f.name, firstPage.dir);
+          if(state.file !== f.name) return;
+        }else{
+          state.file = f.name; state.page = null; state.layout = null;
+          $("#stage").style.display = "none";
+          $("#empty").style.display = "flex";
+          $("#crumb").textContent = f.source_file || f.name;
+          $("#markdownLink").disabled = false;
+          renderList(); closeDetail();
+        }
+        await openMarkdown(f.name);
+      };
+      head.appendChild(markdownButton);
+    }
     const pages = el("div", {class:"pages"});
     for(const p of (f.pages || [])){
       if(!p.dir || p.status === "failed") continue;
@@ -834,6 +1263,7 @@ function renderFiles(){
 
 /* ---------------- page load ---------------- */
 async function selectPage(file, pageDir){
+  const previousFile = state.file;
   state.file = file; state.page = pageDir; state.selId = null;
   updateSelectionLabel();
   state.vecCache = {}; state.nativeCache = {};
@@ -841,7 +1271,15 @@ async function selectPage(file, pageDir){
     x.classList.toggle("sel", x.dataset.file===file && x.dataset.page===pageDir));
 
   const layout = await jget(`/api/layout/${enc(file)}/${enc(pageDir)}`);
+  if(state.file !== file || state.page !== pageDir) return;
   state.layout = layout;
+  $("#stage").style.display = "";
+  const fileInfo = state.files.find(item => item.name === file);
+  const markdownLink = $("#markdownLink");
+  markdownLink.disabled = !fileInfo?.has_markdown;
+  markdownLink.title = tr(fileInfo?.has_markdown ? "Markdown 문서 열기" : "Markdown 파일이 없습니다");
+  if(!fileInfo?.has_markdown) setDocumentView("page");
+  else if(state.documentView === "markdown" && previousFile !== file) openMarkdown(file);
   $("#empty").style.display = "none";
   $("#hud").style.display = "";
   $("#crumb").innerHTML = `<b>${esc(file)}</b> / ${esc(pageDir)} · ${layout.size.width}×${layout.size.height}px` +
@@ -1197,12 +1635,41 @@ function initSplitter(id, onMove, onReset, vertical){
       document.body.classList.remove("resizing", "resizing-v");
       bar.removeEventListener("pointermove", move);
       bar.removeEventListener("pointerup", up);
+      bar.removeEventListener("pointercancel", up);
     };
     bar.addEventListener("pointermove", move);
     bar.addEventListener("pointerup", up);
+    bar.addEventListener("pointercancel", up);
   });
   bar.addEventListener("dblclick", onReset);
 }
+function updateLogSplitter(){
+  const bar = $("#splitLog");
+  bar.setAttribute("aria-valuemin", "72");
+  bar.setAttribute("aria-valuemax", String(Math.max(72, $("#side").clientHeight - 105)));
+  bar.setAttribute("aria-valuenow", String(Math.round($("#processLogPanel").getBoundingClientRect().height)));
+}
+function resizeLog(height){
+  const value = clamp(height, 72, Math.max(72, $("#side").clientHeight - 105));
+  rootStyle.setProperty("--h-log", value + "px");
+  saveSplit("log", Math.round(value));
+  updateLogSplitter();
+}
+function resetLog(){
+  rootStyle.removeProperty("--h-log"); saveSplit("log", null); updateLogSplitter();
+}
+initSplitter("splitLog", event => {
+  resizeLog(event.clientY - $("#side").getBoundingClientRect().top);
+}, resetLog, true);
+$("#splitLog").addEventListener("keydown", event => {
+  if(!["ArrowUp", "ArrowDown", "Home", "End", "Enter"].includes(event.key)) return;
+  event.preventDefault();
+  if(event.key === "Enter") return resetLog();
+  const current = $("#processLogPanel").getBoundingClientRect().height;
+  resizeLog(event.key === "Home" ? 72 : event.key === "End" ? $("#side").clientHeight - 105 :
+    current + (event.key === "ArrowDown" ? 16 : -16));
+});
+window.addEventListener("resize", updateLogSplitter);
 initSplitter("splitL", e => {
   const w = clamp(e.clientX, 150, Math.min(560, window.innerWidth * 0.4));
   rootStyle.setProperty("--w-side", w + "px"); saveSplit("side", Math.round(w));
@@ -1221,6 +1688,7 @@ initSplitter("splitD", e => {
   if(s.side)    rootStyle.setProperty("--w-side", s.side + "px");
   if(s.detail)  rootStyle.setProperty("--w-detail", s.detail + "px");
   if(s.hdetail) rootStyle.setProperty("--h-detail", s.hdetail + "%");
+  if(s.log)     rootStyle.setProperty("--h-log", s.log + "px");
 })();
 
 setLanguage(language);
@@ -1243,12 +1711,15 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--no-browser", action="store_true", help="do not open the web browser")
-    ap.add_argument("--enable-local-processing", action="store_true",
-            help="enable local folder browsing and parser jobs (loopback only)")
+    processing_mode = ap.add_mutually_exclusive_group()
+    processing_mode.add_argument("--enable-local-processing", action="store_true", default=None,
+                   help="enable processing (default on loopback hosts)")
+    processing_mode.add_argument("--read-only", action="store_true", help="disable local processing controls")
     args = ap.parse_args()
 
     if args.enable_local_processing and args.host not in {"127.0.0.1", "localhost", "::1"}:
       ap.error("--enable-local-processing requires a loopback --host")
+    local_processing = not args.read_only and args.host in {"127.0.0.1", "localhost", "::1"}
 
     config_path = resolve_config_path(args.config, ROOT)
     cfg = load_config(config_path)
@@ -1266,7 +1737,7 @@ def main():
         print(f"[WARN] output folder not found: {out_root} (run main.py first)")
 
     app = create_app(out_root, input_root=input_root, config_path=config_path,
-             workspace_root=work_root, enable_local_processing=args.enable_local_processing)
+             workspace_root=work_root, enable_local_processing=local_processing)
     url = f"http://{args.host}:{args.port}"
     print(f"Serving {out_root} at {url}  (Ctrl+C to stop)")
     if not args.no_browser:

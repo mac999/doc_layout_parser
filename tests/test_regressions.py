@@ -5,7 +5,7 @@ import base64
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 import main
 import viewer
@@ -21,7 +21,7 @@ from pipeline.vectorize import vectorize_region, native_vectors_for_region, nati
 from pipeline.ocr import classify_text, get_text_items, merge_text_words, _ocr_page
 from pipeline.table import _merge_spans, _assign_cell_text
 from pipeline.evaluate import evaluate_layout
-from pipeline.export import save_json, validate_layout, output_validator, export_page
+from pipeline.export import save_json, validate_layout, output_validator, export_page, layout_to_markdown
 from viewer import create_app
 
 
@@ -58,8 +58,145 @@ class ContractTests(unittest.TestCase):
                 validate_layout(layout, root, {"r001": [{"points": [[10, 10], [100, 100]],
                     "num_points": 2, "group": 0, "closed": False}]})
 
+    def test_markdown_preserves_reading_order_and_table_content(self):
+        layout = {"page": 1, "regions": [
+            {"type": "text", "bbox": [0, 30, 10, 40], "text": "Second"},
+            {"type": "table", "bbox": [0, 50, 20, 70], "table": {
+                "rows": 2, "cols": 2, "cells": [
+                    {"row": 0, "col": 0, "text": "A|B"},
+                    {"row": 0, "col": 1, "text": "Value"},
+                    {"row": 1, "col": 0, "text": "x"},
+                    {"row": 1, "col": 1, "text": "1"}]}},
+            {"type": "text", "bbox": [2, 55, 8, 60], "text": "duplicate"},
+            {"type": "text", "bbox": [0, 10, 10, 20], "text": "First"}]}
+        markdown = layout_to_markdown(layout)
+        self.assertLess(markdown.index("First"), markdown.index("Second"))
+        self.assertIn("| A\\|B | Value |", markdown)
+        self.assertNotIn("duplicate", markdown)
+
 
 class ViewerTests(unittest.TestCase):
+    def test_local_processing_stop_and_options(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "scan.png"
+            source.touch()
+            client = create_app(root / "output", workspace_root=root,
+                                enable_local_processing=True).test_client()
+            payload = {"input_dir": str(root), "markdown": False, "skip_existing": True}
+            with patch("viewer.preflight", side_effect=lambda cfg, files: (cfg, [])), \
+                    patch("viewer.threading.Thread") as thread:
+                response = client.post("/api/local/process", json=payload)
+                self.assertEqual(response.status_code, 202)
+                job_id = response.json["id"]
+                self.assertEqual(client.get("/api/local/settings").json["active_job"]["id"], job_id)
+                terminate = Mock()
+
+                def output_lines():
+                    stopped = client.post(f"/api/local/jobs/{job_id}/stop")
+                    self.assertEqual(stopped.status_code, 202)
+                    self.assertEqual(stopped.json["status"], "stopping")
+                    self.assertEqual(client.post("/api/local/process", json=payload).status_code, 409)
+                    yield "Stopped fixture\n"
+
+                process = SimpleNamespace(stdout=output_lines(), wait=lambda: -15,
+                                          poll=lambda: None, terminate=terminate)
+                with patch("viewer.subprocess.Popen", return_value=process) as launch:
+                    thread.call_args.kwargs["target"](*thread.call_args.kwargs["args"])
+                terminate.assert_called_once()
+                self.assertIn("--skip-existing", launch.call_args.args[0])
+                self.assertNotIn("--markdown", launch.call_args.args[0])
+                self.assertEqual(client.get(f"/api/local/jobs/{job_id}").json["status"], "stopped")
+                self.assertIsNone(client.get("/api/local/settings").json["active_job"])
+                self.assertEqual(client.post(f"/api/local/jobs/{job_id}/stop").status_code, 200)
+                self.assertEqual(client.post("/api/local/process", json={**payload, "skip_existing": "yes"}).status_code, 400)
+                second = client.post("/api/local/process", json=payload).json
+                self.assertEqual(client.post(f"/api/local/jobs/{second['id']}/stop").status_code, 202)
+                early_terminate = Mock()
+                process = SimpleNamespace(stdout=[], wait=lambda: -15, terminate=early_terminate)
+                with patch("viewer.subprocess.Popen", return_value=process):
+                    thread.call_args.kwargs["target"](*thread.call_args.kwargs["args"])
+                early_terminate.assert_called_once()
+
+    def test_processing_progress_tracks_skips_and_utf8_logs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "scan.png").touch()
+            (root / "한글.png").touch()
+            client = create_app(root / "output", workspace_root=root,
+                                enable_local_processing=True).test_client()
+            payload = {"input_dir": str(root), "skip_existing": True}
+            with patch("viewer.preflight", side_effect=lambda cfg, files: (cfg, [])), \
+                    patch("viewer.threading.Thread") as thread:
+                response = client.post("/api/local/process", json=payload)
+                self.assertEqual(response.status_code, 202)
+                job_id = response.json["id"]
+                self.assertEqual(response.json["progress"]["total_pages"], 2)
+                process = SimpleNamespace(
+                    stdout=iter([
+                        "MuPDF error: syntax error: unknown keyword: '0rg'\n",
+                        "\n",
+                        "[SKIP] scan.png: output already exists\n",
+                        "=== 한글.png ===\n",
+                        "  page 1: 1 regions {'text': 1}\n",
+                    ]),
+                    wait=lambda: 0,
+                    poll=lambda: 0,
+                )
+                with patch("viewer.subprocess.Popen", return_value=process) as launch:
+                    thread.call_args.kwargs["target"](*thread.call_args.kwargs["args"])
+                completed = client.get(f"/api/local/jobs/{job_id}").json
+                self.assertEqual(completed["status"], "complete")
+                self.assertEqual(completed["progress"]["completed_pages"], 2)
+                self.assertIn("=== 한글.png ===", completed["log"])
+                self.assertNotIn("MuPDF error: syntax error: unknown keyword: '0rg'", completed["log"])
+                self.assertEqual(launch.call_args.kwargs["env"]["PYTHONIOENCODING"], "utf-8")
+
+    def test_viewer_cli_local_default_and_read_only(self):
+        for arguments, enabled in [([], True), (["--read-only"], False), (["--host", "0.0.0.0"], False)]:
+            with self.subTest(arguments=arguments), patch("sys.argv", ["viewer.py", "--no-browser", *arguments]), \
+                    patch("viewer.create_app") as factory:
+                viewer.main()
+                self.assertEqual(factory.call_args.kwargs["enable_local_processing"], enabled)
+
+    def test_markdown_document_is_discoverable_and_served(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document = root / "scan.png-hash"
+            document.mkdir()
+            (document / "result.json").write_text(json.dumps({
+                "source_file": "scan.png", "status": "complete", "num_pages": 1,
+                "pages": [{"page": 1, "dir": "page_001", "status": "complete"}]}),
+                encoding="utf-8")
+            markdown = document / "document.md"
+            markdown.write_text("## Page 1\n\nHello", encoding="utf-8")
+            legacy = root / "without-markdown"
+            legacy.mkdir()
+            (legacy / "result.json").write_text(json.dumps({"source_file": "old.pdf", "pages": []}),
+                                                encoding="utf-8")
+            client = create_app(root).test_client()
+
+            listing = client.get("/api/files").get_json()
+            markdown_info = next(item for item in listing["files"] if item["name"] == document.name)
+            legacy_info = next(item for item in listing["files"] if item["name"] == legacy.name)
+            self.assertTrue(markdown_info["has_markdown"])
+            self.assertFalse(legacy_info["has_markdown"])
+            response = client.get("/files/scan.png-hash/document.md")
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("Hello", response.get_data(as_text=True))
+            response.close()
+            download = client.get("/files/scan.png-hash/document.md?download=1")
+            self.assertEqual(download.status_code, 200)
+            self.assertIn("attachment", download.headers["Content-Disposition"])
+            self.assertIn("document.md", download.headers["Content-Disposition"])
+            self.assertIn("Hello", download.get_data(as_text=True))
+            download.close()
+            page = client.get("/").get_data(as_text=True)
+            self.assertIn('id="markdownLink"', page)
+            self.assertIn('id="markdownView"', page)
+            self.assertEqual(page.count('id="languageToggle"'), 1)
+            self.assertIn("Open Markdown document", page)
+
     def test_failure_records_and_incomplete_results(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -89,6 +226,12 @@ class ViewerTests(unittest.TestCase):
             listing = client.get("/api/local/browse", query_string={"path": str(root), "mode": "input"})
             self.assertEqual(listing.status_code, 200)
             self.assertIn("input", [entry["name"] for entry in listing.json["entries"]])
+            output_listing = client.get("/api/local/browse", query_string={"path": str(root), "mode": "output"})
+            self.assertEqual(output_listing.status_code, 200)
+            page = client.get("/").get_data(as_text=True)
+            self.assertIn('id="outputPathButton"', page)
+            self.assertIn('id="processLogHeading">처리 로그', page)
+            self.assertIn('data-empty="로그가 아직 없습니다."', page)
             outside = Path.home().parent.resolve()
             denied = client.get("/api/local/browse", query_string={"path": str(outside)})
             self.assertEqual(denied.status_code, 403)
@@ -106,18 +249,24 @@ class ViewerTests(unittest.TestCase):
             config_file = root / "config.json"
             config_file.write_text(json.dumps({"ocr": {"gpu": False}, "classify": {"use_vlm": False}}),
                                    encoding="utf-8")
+            output_dir = root / "chosen-output"
+            output_dir.mkdir()
             app = create_app(root / "output", input_root=input_dir, workspace_root=root,
                              config_path=config_file, enable_local_processing=True)
             client = app.test_client()
+            output_listing = client.get("/api/local/browse", query_string={"path": str(root), "mode": "output"})
+            self.assertIn("chosen-output", [entry["name"] for entry in output_listing.json["entries"]])
             with patch("viewer.preflight", side_effect=lambda cfg, files: (cfg, [])), \
                     patch("viewer.threading.Thread") as thread:
                 response = client.post("/api/local/process", json={"input_dir": str(input_dir),
-                                                                     "config_path": str(config_file)})
+                    "output_dir": str(output_dir), "config_path": str(config_file)})
                 self.assertEqual(response.status_code, 202)
                 self.assertTrue(thread.return_value.start.called)
                 config = thread.call_args.kwargs["args"][1]
                 self.assertEqual(config["input_dir"], str(input_dir.resolve()))
-                self.assertEqual(config["output_dir"], str((root / "output").resolve()))
+                self.assertEqual(config["output_dir"], str(output_dir.resolve()))
+                self.assertEqual(response.json["output_dir"], str(output_dir.resolve()))
+                self.assertEqual(client.get("/api/files").json["output_dir"], str(output_dir.resolve()))
                 self.assertFalse(config["ocr"]["gpu"])
                 self.assertFalse(config["classify"]["use_vlm"])
                 duplicate = client.post("/api/local/process", json={"input_dir": str(input_dir),
@@ -128,8 +277,10 @@ class ViewerTests(unittest.TestCase):
                 worker = thread.call_args.kwargs["target"]
                 args = thread.call_args.kwargs["args"]
                 fake_process = SimpleNamespace(stdout=["Processing scan.png\n"], wait=lambda: 0)
-                with patch("viewer.subprocess.Popen", return_value=fake_process):
+                with patch("viewer.subprocess.Popen", return_value=fake_process) as launch:
                     worker(*args)
+                self.assertIn("--markdown", launch.call_args.args[0])
+                self.assertNotIn("--skip-existing", launch.call_args.args[0])
                 completed = client.get(f"/api/local/jobs/{response.json['id']}")
                 self.assertEqual(completed.json["status"], "complete")
                 self.assertIn("Processing scan.png", completed.json["log"])
@@ -451,6 +602,27 @@ class CoordinateTests(unittest.TestCase):
 
 
 class OutputTests(unittest.TestCase):
+    def test_skip_existing_preserves_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "sheet.pdf"
+            source.touch()
+            target = root / main.output_key(source)
+            target.mkdir()
+            previous = target / "result.json"
+            previous.write_text("previous", encoding="utf-8")
+            with patch.object(main, "_process_file") as process:
+                result = main.process_file(source, load_config(), root, skip_existing=True, markdown=True)
+            process.assert_not_called()
+            self.assertEqual(result["status"], "skipped")
+            self.assertEqual(previous.read_text(encoding="utf-8"), "previous")
+            self.assertEqual(list(target.iterdir()), [previous])
+            (root / "new.pdf").touch()
+            with patch.object(main, "_process_file", return_value={"status": "complete"}) as process:
+                result = main.process_file(root / "new.pdf", load_config(), root, skip_existing=True)
+            process.assert_called_once()
+            self.assertEqual(result["status"], "complete")
+
     def test_publication_failure_restores_backup(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -506,7 +678,7 @@ class OutputTests(unittest.TestCase):
             self.assertEqual([page["status"] for page in failure["pages"]], ["complete", "failed"])
             self.assertEqual(failure["status"], "failed")
 
-    def test_success_replaces_stale_files(self):
+    def test_success_replaces_stale_files_and_writes_markdown(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "sheet.pdf"
@@ -517,10 +689,12 @@ class OutputTests(unittest.TestCase):
             with patch.object(main, "load_pages", return_value=(page for page in [SimpleNamespace(page_no=1)])), \
                     patch.object(main, "maybe_upscale", side_effect=lambda page, cfg: page), \
                     patch.object(main, "process_page", return_value={
-                        "regions": [], "num_regions": 0, "size": [10, 10]}):
-                result = main.process_file(source, load_config(), root)
+                        "regions": [{"type": "text", "bbox": [0, 0, 10, 10], "text": "Hello"}],
+                        "page": 1, "num_regions": 1, "size": [10, 10]}):
+                result = main.process_file(source, load_config(), root, markdown=True)
             self.assertFalse((target / "stale").exists())
             self.assertTrue((target / "result.json").exists())
+            self.assertIn("Hello", (target / "document.md").read_text(encoding="utf-8"))
             self.assertEqual(len(result["input"]["sha256"]), 64)
             self.assertEqual(result["config"], load_config())
             self.assertEqual(result["status"], "complete")

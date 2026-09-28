@@ -31,7 +31,8 @@ from pipeline.table import (try_parse_table, merge_split_tables, detect_page_tab
                             dedupe_table_regions)
 from pipeline.vlm import VlmSession
 from pipeline.vectorize import vectorize_region, native_vectors_for_region, native_coverage
-from pipeline.export import export_page, save_json, build_manifest, output_validator
+from pipeline.export import (export_page, save_json, build_manifest, output_validator,
+                             layout_to_markdown)
 
 ROOT = Path(__file__).parent
 
@@ -155,19 +156,23 @@ def output_key(file_path: Path) -> str:
     return f"{file_path.name}-{hashlib.sha256(identity).hexdigest()[:12]}"
 
 
-def process_file(file_path: Path, cfg: dict, out_root: Path, warnings=()) -> dict:
+def process_file(file_path: Path, cfg: dict, out_root: Path, warnings=(), markdown=False,
+                skip_existing=False) -> dict:
     """Publish completed results, rolling back a failed directory replacement."""
     validate_config(cfg)
     out_root.mkdir(parents=True, exist_ok=True)
     key = output_key(file_path)
     out_dir = out_root / key
+    if skip_existing and out_dir.exists():
+        print(f"[SKIP] {file_path.name}: output already exists")
+        return {"status": "skipped", "output_key": key}
     stage = Path(tempfile.mkdtemp(prefix=f".{key}-", dir=out_root))
     backup = out_root / f".{key}.backup-{uuid.uuid4().hex}"
     manifest = {"schema_version": "1.0", "run_id": uuid.uuid4().hex, "status": "running",
                 "source_file": file_path.name, "pages": [], "warnings": list(warnings)}
     try:
         manifest = build_manifest(file_path, cfg, manifest["run_id"], list(warnings))
-        result = _process_file(file_path, cfg, stage, manifest)
+        result = _process_file(file_path, cfg, stage, manifest, markdown)
         if out_dir.exists():
             out_dir.rename(backup)
         try:
@@ -193,10 +198,11 @@ def process_file(file_path: Path, cfg: dict, out_root: Path, warnings=()) -> dic
     return result
 
 
-def _process_file(file_path: Path, cfg: dict, out_dir: Path, manifest: dict) -> dict:
+def _process_file(file_path: Path, cfg: dict, out_dir: Path, manifest: dict, markdown=False) -> dict:
     print(f"\n=== {file_path.name} ===")
 
     pages_summary = manifest["pages"]
+    markdown_pages = []
     vlm_session = VlmSession()
     with closing(iter(load_pages(file_path, cfg))) as pages:
         for page in pages:
@@ -207,6 +213,8 @@ def _process_file(file_path: Path, cfg: dict, out_dir: Path, manifest: dict) -> 
                 page = maybe_upscale(page, cfg)
                 page_dir = out_dir / f"page_{page.page_no:03d}"
                 layout = process_page(page, cfg, page_dir, vlm_session)
+                if markdown:
+                    markdown_pages.append(layout_to_markdown(layout))
                 counts = {}
                 for region in layout["regions"]:
                     counts[region["type"]] = counts.get(region["type"], 0) + 1
@@ -224,6 +232,8 @@ def _process_file(file_path: Path, cfg: dict, out_dir: Path, manifest: dict) -> 
 
     if not pages_summary:
         raise ValueError("Input contains no pages")
+    if markdown:
+        (out_dir / "document.md").write_text("\n\n---\n\n".join(markdown_pages) + "\n", encoding="utf-8")
     manifest.update(status="complete", vlm_calls=vlm_session.calls,
                     vlm_elapsed_sec=round(vlm_session.elapsed_sec, 3))
     output_validator().validate(manifest)
@@ -237,6 +247,8 @@ def main():
     ap.add_argument("-i", "--input", default=None,
                     help="single input file path (omit to process the whole input_dir)")
     ap.add_argument("--check", action="store_true", help="check prerequisites without processing")
+    ap.add_argument("--markdown", action="store_true", help="also export parsed text and tables to document.md")
+    ap.add_argument("--skip-existing", action="store_true", help="skip inputs with an existing output folder")
     args = ap.parse_args()
 
     config_path = resolve_config_path(args.config, ROOT)
@@ -259,15 +271,19 @@ def main():
         print(f"Ready: {len(files)} inputs; OCR device: {'CUDA' if cfg['ocr']['gpu'] else 'CPU'}")
         return 0
 
-    ok, failed = 0, 0
+    ok, failed, skipped = 0, 0, 0
     for f in files:
         try:
-            process_file(f, cfg, out_root, warnings)
-            ok += 1
+            result = process_file(f, cfg, out_root, warnings, markdown=args.markdown,
+                                  skip_existing=args.skip_existing)
+            if result.get("status") == "skipped":
+                skipped += 1
+            else:
+                ok += 1
         except Exception:
             failed += 1
             print(f"[FAILED] {f.name}\n{traceback.format_exc()}")
-    print(f"\nDone: {ok} succeeded, {failed} failed -> {out_root}")
+    print(f"\nDone: {ok} succeeded, {skipped} skipped, {failed} failed -> {out_root}")
     return 0 if failed == 0 else 1
 
 

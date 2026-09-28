@@ -30,6 +30,46 @@ def save_json(path: Path, data) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2, allow_nan=False)
 
 
+def _markdown_cell(value: str) -> str:
+    return str(value or "").replace("|", "\\|").replace("\r", " ").replace("\n", " ").strip()
+
+
+def layout_to_markdown(layout: dict) -> str:
+    """Render a page's text and parsed tables as Markdown in reading order."""
+    tables = [region for region in layout["regions"] if region.get("table")]
+    blocks = []
+    for region in layout["regions"]:
+        bounds = region["bbox"]
+        if region.get("table"):
+            table = region["table"]
+            rows, columns = table["rows"], table["cols"]
+            grid = [[""] * columns for _ in range(rows)]
+            for cell in table["cells"]:
+                grid[cell["row"]][cell["col"]] = _markdown_cell(cell.get("text", ""))
+            lines = ["| " + " | ".join(row) + " |" for row in grid]
+            if lines:
+                lines.insert(1, "| " + " | ".join(["---"] * columns) + " |")
+            block = "\n".join(lines)
+        elif region["type"] in {"text", "dimension", "annotation"}:
+            center_x = (bounds[0] + bounds[2]) / 2
+            center_y = (bounds[1] + bounds[3]) / 2
+            if any(box["bbox"][0] <= center_x <= box["bbox"][2]
+                   and box["bbox"][1] <= center_y <= box["bbox"][3] for box in tables):
+                continue
+            text = region.get("text") or " ".join(word["text"] for word in region.get("words", []))
+            text = " ".join(str(text).split())
+            if not text:
+                continue
+            block = text
+        else:
+            continue
+        blocks.append((bounds[1], bounds[0], block))
+    blocks.sort(key=lambda item: (item[0], item[1]))
+    page = f'## Page {layout["page"]}'
+    content = "\n\n".join(block for _, _, block in blocks)
+    return f"{page}\n\n{content}" if content else page
+
+
 @lru_cache(maxsize=1)
 def output_validator():
     schema = json.loads((Path(__file__).parent / "result.schema.json").read_text(encoding="utf-8"))
