@@ -13,6 +13,25 @@ Run parsing headlessly from the command line, then inspect saved results with th
 <img src="./doc/img3.png" width="500"></img> 
 </p>
 
+## Contents
+
+- [Overview](#overview)
+- [Output structure](#output-structure)
+  - [JSON format](#json-format)
+- [Installation](#installation)
+- [CLI usage](#cli-usage)
+- [Result viewer (viewer.py)](#result-viewer-viewerpy)
+  - [Server use](#server-use)
+  - [Demo recording](#demo-recording)
+- [Add-in stages (addin/)](#add-in-stages-addin)
+- [Configuration (config.json)](#configuration-configjson)
+- [Validation and operation](#validation-and-operation)
+- [Supported scope](#supported-scope)
+- [Technology choices](#technology-choices)
+- [Known limitations](#known-limitations)
+- [Revision history](#revision-history)
+- [Author](#author)
+
 ## Overview
 
 The parser and viewer run independently: `main.py` processes one file or a batch,
@@ -598,5 +617,17 @@ records, not published page links.
 - The local llava model is a weak classifier; keep the heuristic as the primary
   signal or switch to a commercial VLM for higher accuracy.
 
-# Author 
+## Revision history
+
+| Date | Change |
+|---|---|
+| 2026-10-11 | Add-in stages (`addin/`): user modules run after the parse and emit new formats, with `scale_calibrate` and `dxf_export` bundled. Page `layout.json` now names its source document. |
+| 2026-09-28 | CLI processing options documented and extended |
+| 2026-09-26 | pip packaging, local processing controls in the viewer, bilingual viewer with an interactive demo, README consolidation |
+| 2026-09-25 | Parser reliability, output validation and resource limits |
+| 2026-08-13 | Duplicate table regions on a page dropped |
+| 2026-07-09 | Initial release |
+
+## Author
+
 laputa99999@gmail.com
