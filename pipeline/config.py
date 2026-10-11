@@ -54,7 +54,12 @@ DEFAULTS = {
         "min_boundary_span_ratio": 0.6, "min_cell_text_ratio": 0.45,
     },
     "export": {"save_page_image": True, "save_region_crops": True, "save_overlay": True, "save_svg": True},
+    "stages": {"addin_dir": "addin", "enabled": [], "on_error": "warn", "settings": {}},
 }
+
+# Per-stage blocks are named by the user, so their keys cannot be checked
+# against DEFAULTS. Their contents are the add-in's own contract.
+FREEFORM = {"stages.settings"}
 
 
 def _merge(base: dict, override: dict) -> dict:
@@ -93,6 +98,10 @@ def validate_config(cfg: dict) -> None:
                 raise ValueError(f"Missing setting: {name}")
             value = values[key]
             if isinstance(default, dict):
+                if name in FREEFORM:
+                    if not isinstance(value, dict):
+                        raise ValueError(f"{name} must be an object")
+                    continue
                 visit(value, default, name + ".")
                 continue
             expected = (int, float) if isinstance(default, float) else type(default)
@@ -130,6 +139,16 @@ def validate_config(cfg: dict) -> None:
     heuristic = cfg["classify"]["heuristic"]
     if not 0 <= heuristic["dark_gray_max"] < heuristic["light_gray_min"] <= 255:
         raise ValueError("Gray thresholds must satisfy 0 <= dark < light <= 255")
+    stages = cfg["stages"]
+    if stages["on_error"] not in {"warn", "fail"}:
+        raise ValueError("stages.on_error must be 'warn' or 'fail'")
+    if any(not isinstance(name, str) or not name.strip() for name in stages["enabled"]):
+        raise ValueError("stages.enabled must contain add-in folder names")
+    if len(set(stages["enabled"])) != len(stages["enabled"]):
+        raise ValueError("stages.enabled must not repeat a stage")
+    unknown = set(stages["settings"]) - set(stages["enabled"])
+    if unknown:
+        raise ValueError(f"stages.settings has blocks for stages that are not enabled: {sorted(unknown)}")
 
 
 def load_config(path: str | Path | None = None) -> dict:

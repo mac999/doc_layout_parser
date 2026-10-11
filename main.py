@@ -30,6 +30,7 @@ from pipeline.regions import detect_graphic_regions, classify_graphic_heuristic,
 from pipeline.table import (try_parse_table, merge_split_tables, detect_page_tables,
                             dedupe_table_regions)
 from pipeline.vlm import VlmSession
+from pipeline.stages import StageRunner
 from pipeline.vectorize import vectorize_region, native_vectors_for_region, native_coverage
 from pipeline.export import (export_page, save_json, build_manifest, output_validator,
                              layout_to_markdown)
@@ -37,7 +38,7 @@ from pipeline.export import (export_page, save_json, build_manifest, output_vali
 ROOT = Path(__file__).parent
 
 
-def process_page(page, cfg: dict, page_dir: Path, vlm_session=None) -> dict:
+def process_page(page, cfg: dict, page_dir: Path, vlm_session=None, source: dict | None = None) -> dict:
     """Process one page: classify the layout, parse each region type, save results."""
     regions = []
     rid = 0
@@ -148,7 +149,7 @@ def process_page(page, cfg: dict, page_dir: Path, vlm_session=None) -> dict:
             vectors_by_region[region["id"]] = polylines
             region["num_polylines"] = len(polylines)
 
-    return export_page(page_dir, page, regions, vectors_by_region, page.native_polylines, cfg)
+    return export_page(page_dir, page, regions, vectors_by_region, page.native_polylines, cfg, source)
 
 
 def output_key(file_path: Path) -> str:
@@ -157,7 +158,7 @@ def output_key(file_path: Path) -> str:
 
 
 def process_file(file_path: Path, cfg: dict, out_root: Path, warnings=(), markdown=False,
-                skip_existing=False) -> dict:
+                skip_existing=False, work_root: Path | None = None) -> dict:
     """Publish completed results, rolling back a failed directory replacement."""
     validate_config(cfg)
     out_root.mkdir(parents=True, exist_ok=True)
@@ -172,7 +173,8 @@ def process_file(file_path: Path, cfg: dict, out_root: Path, warnings=(), markdo
                 "source_file": file_path.name, "pages": [], "warnings": list(warnings)}
     try:
         manifest = build_manifest(file_path, cfg, manifest["run_id"], list(warnings))
-        result = _process_file(file_path, cfg, stage, manifest, markdown)
+        result = _process_file(file_path, cfg, stage, manifest, markdown, key,
+                               work_root or Path.cwd())
         if out_dir.exists():
             out_dir.rename(backup)
         try:
@@ -198,42 +200,64 @@ def process_file(file_path: Path, cfg: dict, out_root: Path, warnings=(), markdo
     return result
 
 
-def _process_file(file_path: Path, cfg: dict, out_dir: Path, manifest: dict, markdown=False) -> dict:
+def _process_file(file_path: Path, cfg: dict, out_dir: Path, manifest: dict, markdown=False,
+                  output_key: str = "", work_root: Path | None = None) -> dict:
     print(f"\n=== {file_path.name} ===")
 
     pages_summary = manifest["pages"]
     markdown_pages = []
+    stage_pages = []
     vlm_session = VlmSession()
-    with closing(iter(load_pages(file_path, cfg))) as pages:
-        for page in pages:
-            started = time.monotonic()
-            summary = {"page": page.page_no, "status": "failed"}
-            pages_summary.append(summary)
-            try:
-                page = maybe_upscale(page, cfg)
-                page_dir = out_dir / f"page_{page.page_no:03d}"
-                layout = process_page(page, cfg, page_dir, vlm_session)
-                if markdown:
-                    markdown_pages.append(layout_to_markdown(layout))
-                counts = {}
-                for region in layout["regions"]:
-                    counts[region["type"]] = counts.get(region["type"], 0) + 1
-                summary.update(status="complete", dir=page_dir.name, size=layout["size"],
-                               region_counts=counts, num_regions=layout["num_regions"],
-                               warnings=layout.get("warnings", []),
-                               coordinate_transform=layout.get("coordinate_transform", {}))
-                manifest["num_pages"] += 1
-                print(f"  page {page.page_no}: {layout['num_regions']} regions {counts}")
-            except Exception as error:
-                summary.update(error_type=type(error).__name__, error=str(error))
-                raise
-            finally:
-                summary["elapsed_sec"] = round(time.monotonic() - started, 3)
+    manifest["output_key"] = output_key
+    source = {"source_file": file_path.name, "output_key": output_key}
+    runner = StageRunner(cfg, work_root or Path.cwd())
+    if runner.active:
+        print(f"  [stage] {len(runner.stages)} add-in(s): "
+              f"{', '.join(stage.name for stage in runner.stages)}")
+        runner.setup()
 
-    if not pages_summary:
-        raise ValueError("Input contains no pages")
-    if markdown:
-        (out_dir / "document.md").write_text("\n\n---\n\n".join(markdown_pages) + "\n", encoding="utf-8")
+    try:
+        with closing(iter(load_pages(file_path, cfg))) as pages:
+            for page in pages:
+                started = time.monotonic()
+                summary = {"page": page.page_no, "status": "failed"}
+                pages_summary.append(summary)
+                try:
+                    page = maybe_upscale(page, cfg)
+                    page_dir = out_dir / f"page_{page.page_no:03d}"
+                    layout = process_page(page, cfg, page_dir, vlm_session, source)
+                    if runner.active:
+                        stage_pages.append(runner.run_page(page_dir, layout))
+                    if markdown:
+                        markdown_pages.append(layout_to_markdown(layout))
+                    counts = {}
+                    for region in layout["regions"]:
+                        counts[region["type"]] = counts.get(region["type"], 0) + 1
+                    summary.update(status="complete", dir=page_dir.name, size=layout["size"],
+                                   region_counts=counts, num_regions=layout["num_regions"],
+                                   warnings=layout.get("warnings", []),
+                                   coordinate_transform=layout.get("coordinate_transform", {}))
+                    manifest["num_pages"] += 1
+                    print(f"  page {page.page_no}: {layout['num_regions']} regions {counts}")
+                except Exception as error:
+                    summary.update(error_type=type(error).__name__, error=str(error))
+                    raise
+                finally:
+                    summary["elapsed_sec"] = round(time.monotonic() - started, 3)
+
+        if not pages_summary:
+            raise ValueError("Input contains no pages")
+        if markdown:
+            (out_dir / "document.md").write_text("\n\n---\n\n".join(markdown_pages) + "\n",
+                                                 encoding="utf-8")
+        # Document stages run while the add-ins still hold their models.
+        if runner.active:
+            runner.run_document(out_dir, manifest, stage_pages)
+    finally:
+        if runner.active:
+            runner.teardown()
+            manifest.update(runner.summary())
+
     manifest.update(status="complete", vlm_calls=vlm_session.calls,
                     vlm_elapsed_sec=round(vlm_session.elapsed_sec, 3))
     output_validator().validate(manifest)
@@ -275,7 +299,7 @@ def main():
     for f in files:
         try:
             result = process_file(f, cfg, out_root, warnings, markdown=args.markdown,
-                                  skip_existing=args.skip_existing)
+                                  skip_existing=args.skip_existing, work_root=work_root)
             if result.get("status") == "skipped":
                 skipped += 1
             else:
