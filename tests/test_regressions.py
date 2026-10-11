@@ -22,6 +22,7 @@ from pipeline.ocr import classify_text, get_text_items, merge_text_words, _ocr_p
 from pipeline.table import _merge_spans, _assign_cell_text
 from pipeline.evaluate import evaluate_layout
 from pipeline.export import save_json, validate_layout, output_validator, export_page, layout_to_markdown
+from pipeline.stages import Artifact, Stage, StageRunner, load_stage
 from viewer import create_app
 
 
@@ -284,6 +285,158 @@ class ViewerTests(unittest.TestCase):
                 completed = client.get(f"/api/local/jobs/{response.json['id']}")
                 self.assertEqual(completed.json["status"], "complete")
                 self.assertIn("Processing scan.png", completed.json["log"])
+
+
+
+class StageTests(unittest.TestCase):
+    """Add-in contract: identity, ordering, isolation and artifact hand-off."""
+
+    LAYOUT = {"schema_version": "1.0", "status": "complete", "source_file": "s.pdf",
+              "output_key": "s.pdf-abc", "page": 1, "size": {"width": 40, "height": 20},
+              "coordinate_transform": {"source_space": "pymupdf_unrotated_cropbox_points",
+                                       "source_to_pixel": [2, 0, 0, 2, 0, 0],
+                                       "pixel_to_source": [0.5, 0, 0, 0.5, 0, 0]},
+              "num_regions": 0, "regions": [], "warnings": []}
+
+    def _addin(self, root: Path, name: str, body: str) -> None:
+        folder = root / name
+        folder.mkdir(parents=True)
+        (folder / "stage.py").write_text(body, encoding="utf-8")
+
+    def _cfg(self, root: Path, enabled, settings=None, on_error="warn") -> dict:
+        cfg = load_config()
+        cfg["stages"] = {"addin_dir": str(root), "enabled": list(enabled),
+                         "on_error": on_error, "settings": settings or {}}
+        return cfg
+
+    def test_absent_config_runs_nothing(self):
+        runner = StageRunner(load_config(), Path("."))
+        self.assertFalse(runner.active)
+        self.assertEqual(runner.summary(), {"stages": [], "stage_errors": []})
+
+    def test_folder_name_is_the_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._addin(root, "good", "from pipeline.stages import Stage\n"
+                                      "class S(Stage):\n    pass\nSTAGE = S()\n")
+            self.assertEqual(load_stage(root, "good").name, "good")
+            self._addin(root, "folder", "from pipeline.stages import Stage\n"
+                                        "class S(Stage):\n    name = 'other'\nSTAGE = S()\n")
+            with self.assertRaisesRegex(ValueError, "folder name is the stage identity"):
+                load_stage(root, "folder")
+
+    def test_missing_requirement_is_refused_before_setup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._addin(root, "consumer",
+                        "from pipeline.stages import Stage\n"
+                        "class S(Stage):\n"
+                        "    requires = ('scale',)\n"
+                        "    def setup(self, cfg): raise AssertionError('must not load')\n"
+                        "STAGE = S()\n")
+            with self.assertRaisesRegex(ValueError, "requires"):
+                StageRunner(self._cfg(root, ["consumer"]), root)
+
+    def test_artifacts_reach_the_next_stage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "addin"
+            self._addin(root, "producer",
+                        "from pipeline.stages import Artifact, Stage\n"
+                        "class S(Stage):\n"
+                        "    provides = ('scale',)\n"
+                        "    def on_page(self, ctx):\n"
+                        "        path = ctx.write_json('scale.json', {'px_per_mm': 2.0})\n"
+                        "        return [Artifact(kind='scale', path=path, meta={'px_per_mm': 2.0})]\n"
+                        "STAGE = S()\n")
+            self._addin(root, "consumer",
+                        "from pipeline.stages import Artifact, Stage\n"
+                        "class S(Stage):\n"
+                        "    requires = ('scale',)\n"
+                        "    provides = ('dxf',)\n"
+                        "    def on_page(self, ctx):\n"
+                        "        got = ctx.artifact('scale')\n"
+                        "        assert got.stage == 'producer', got.stage\n"
+                        "        path = ctx.write_json('out.json', {'seen': got.meta['px_per_mm']})\n"
+                        "        return [Artifact(kind='dxf', path=path)]\n"
+                        "STAGE = S()\n")
+            page_dir = Path(temporary) / "page_001"
+            page_dir.mkdir()
+            runner = StageRunner(self._cfg(root, ["producer", "consumer"]), root)
+            runner.setup()
+            runner.run_page(page_dir, self.LAYOUT)
+            self.assertEqual(runner.errors, [])
+            self.assertEqual(json.loads((page_dir / "stages/consumer/out.json").read_text()),
+                             {"seen": 2.0})
+
+    def test_failure_is_contained_and_recorded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "addin"
+            self._addin(root, "boom",
+                        "from pipeline.stages import Stage\n"
+                        "class S(Stage):\n"
+                        "    def on_page(self, ctx): raise RuntimeError('nope')\n"
+                        "STAGE = S()\n")
+            page_dir = Path(temporary) / "page_001"
+            page_dir.mkdir()
+            runner = StageRunner(self._cfg(root, ["boom"]), root)
+            runner.setup()
+            runner.run_page(page_dir, self.LAYOUT)
+            self.assertEqual(len(runner.errors), 1)
+            self.assertEqual(runner.errors[0]["error_type"], "RuntimeError")
+            self.assertEqual(runner.errors[0]["page"], 1)
+            self.assertFalse((page_dir / "stages" / "boom").exists())
+
+            strict = StageRunner(self._cfg(root, ["boom"], on_error="fail"), root)
+            strict.setup()
+            with self.assertRaises(RuntimeError):
+                strict.run_page(page_dir, self.LAYOUT)
+
+    def test_context_is_read_only_and_maps_coordinates(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "addin"
+            self._addin(root, "probe",
+                        "from pipeline.stages import Stage\n"
+                        "class S(Stage):\n"
+                        "    def on_page(self, ctx):\n"
+                        "        ctx.layout['regions'].append({'id': 'injected'})\n"
+                        "        assert ctx.to_source(10, 20) == (5.0, 10.0), ctx.to_source(10, 20)\n"
+                        "        assert ctx.source_file == 's.pdf' and ctx.page_no == 1\n"
+                        "        return []\n"
+                        "STAGE = S()\n")
+            page_dir = Path(temporary) / "page_001"
+            page_dir.mkdir()
+            layout = copy.deepcopy(self.LAYOUT)
+            runner = StageRunner(self._cfg(root, ["probe"]), root)
+            runner.setup()
+            runner.run_page(page_dir, layout)
+            self.assertEqual(runner.errors, [])
+            self.assertEqual(layout["regions"], [])
+
+    def test_non_artifact_return_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "addin"
+            self._addin(root, "sloppy",
+                        "from pipeline.stages import Stage\n"
+                        "class S(Stage):\n"
+                        "    def on_page(self, ctx): return [{'kind': 'dxf'}]\n"
+                        "STAGE = S()\n")
+            page_dir = Path(temporary) / "page_001"
+            page_dir.mkdir()
+            runner = StageRunner(self._cfg(root, ["sloppy"]), root)
+            runner.setup()
+            runner.run_page(page_dir, self.LAYOUT)
+            self.assertEqual(runner.errors[0]["error_type"], "TypeError")
+
+    def test_settings_must_name_enabled_stages(self):
+        cfg = load_config()
+        cfg["stages"] = {"addin_dir": "addin", "enabled": ["a"], "on_error": "warn",
+                         "settings": {"typo": {}}}
+        with self.assertRaisesRegex(ValueError, "not enabled"):
+            validate_config(cfg)
+        cfg["stages"]["enabled"] = ["a", "a"]
+        cfg["stages"]["settings"] = {}
+        with self.assertRaisesRegex(ValueError, "must not repeat"):
+            validate_config(cfg)
 
 
 class EvaluationTests(unittest.TestCase):
