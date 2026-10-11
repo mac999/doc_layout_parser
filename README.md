@@ -415,6 +415,61 @@ python tools/record_demo.py --url http://127.0.0.1:8003
 The recorder also checks language persistence, selection, panning, vector assets
 and desktop/mobile layout. Use `--check-only` to skip writing the GIF.
 
+## Add-in stages (addin/)
+
+Extend the pipeline without editing it. An add-in reads what the parser produced
+— regions, OCR text, polylines, table grids, crops — and writes its own output,
+such as another file format. Two are bundled: `scale_calibrate` resolves how many
+page pixels make a millimetre, and `dxf_export` turns a parsed drawing into one
+DXF per page.
+
+```
+addin/
+  <stage_name>/
+    stage.py            # exports STAGE, an instance of a Stage subclass
+    requirements.txt    # optional, the add-in's own dependencies
+```
+
+```json
+"stages": {
+  "addin_dir": "addin",
+  "enabled": ["scale_calibrate", "dxf_export"],
+  "on_error": "warn",
+  "settings": {"dxf_export": {"units": "mm"}}
+}
+```
+
+`enabled` is both the switch and the run order. Leave it empty and nothing under
+`addin/` is imported, so an add-in with a missing dependency cannot affect a
+normal run.
+
+```python
+from pipeline.stages import Artifact, Stage
+
+class DxfExport(Stage):
+    requires = ("scale",)          # an earlier enabled stage must provide this
+    provides = ("dxf",)
+
+    def setup(self, cfg):          # once per run: load models here
+        ...
+    def on_page(self, ctx):        # per page, after the page directory is complete
+        path = ctx.workdir / f"page_{ctx.page_no:03d}.dxf"
+        ...
+        return [Artifact(kind="dxf", path=path, meta={"page": ctx.page_no})]
+    def on_document(self, ctx):    # once, after every page
+        return []
+
+STAGE = DxfExport()
+```
+
+Each stage receives the artifacts the previous one returned, and writes into
+`page_NNN/stages/<name>/` or `stages/<name>/`. Core output is untouched.
+Dependencies are checked before any model loads, and a failing stage is recorded
+in `result.json` without failing the document.
+
+Full reference, including the context API and the worked DXF example:
+[`addin.md`](addin.md).
+
 ## Configuration (config.json)
 
 Every tuned threshold and heuristic weight in the pipeline lives in
@@ -466,6 +521,10 @@ styles by editing the configuration only.
 | `vectorize.min_polyline_length_px` | Drop polylines shorter than this (noise filter) |
 | `vectorize.native_curve_tolerance_px` | Native cubic chord-error target, default 0.25px after upscaling |
 | `vectorize.min_native_coverage` | Minimum stroke-ink coverage for native-only output, default 0.9; otherwise raster fallback |
+| `stages.addin_dir` | Folder holding the add-in stages (default `addin`) |
+| `stages.enabled` | Add-in folder names to run, in order. Empty disables the feature |
+| `stages.on_error` | `warn` records a stage failure and continues; `fail` aborts the document |
+| `stages.settings` | Per-stage settings, keyed by folder name and defined by each add-in |
 
 ## Validation and operation
 
