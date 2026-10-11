@@ -168,8 +168,12 @@ def draw_overlay(page_img: np.ndarray, regions: list, vectors_by_region: dict) -
 
 
 def export_page(page_dir: Path, page, regions: list, vectors_by_region: dict,
-                native_vectors: list, cfg: dict) -> dict:
-    """Write all page results into page_dir and return the layout.json content."""
+                native_vectors: list, cfg: dict, source: dict | None = None) -> dict:
+    """Write all page results into page_dir and return the layout.json content.
+
+    source carries the document identity (source_file, output_key) so a page's
+    layout.json resolves back to its input without reading ../result.json.
+    """
     exp = cfg["export"]
     page_dir.mkdir(parents=True, exist_ok=True)
     h, w = page.image.shape[:2]
@@ -234,6 +238,7 @@ def export_page(page_dir: Path, page, regions: list, vectors_by_region: dict,
     layout = {
         "schema_version": "1.0",
         "status": "complete",
+        **{k: v for k, v in (source or {}).items() if k in ("source_file", "output_key")},
         "page": page.page_no,
         "size": {"width": w, "height": h},
         "original_size": {"width": page.original_size[0], "height": page.original_size[1]}

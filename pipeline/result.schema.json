@@ -24,6 +24,7 @@
       "required": ["schema_version", "status", "page", "size", "coordinate_transform", "regions", "num_regions", "warnings"],
       "properties": {
         "schema_version": {"const": "1.0"}, "status": {"const": "complete"},
+        "source_file": {"type": "string"}, "output_key": {"type": "string"},
         "page": {"type": "integer", "minimum": 1}, "size": {"$ref": "#/$defs/size"},
         "num_regions": {"type": "integer", "minimum": 0},
         "regions": {"type": "array", "items": {"$ref": "#/$defs/region"}},
