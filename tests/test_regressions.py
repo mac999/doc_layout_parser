@@ -1,5 +1,7 @@
 import tempfile
 import copy
+import importlib.util
+import sys
 import json
 import base64
 import unittest
@@ -437,6 +439,197 @@ class StageTests(unittest.TestCase):
         cfg["stages"]["settings"] = {}
         with self.assertRaisesRegex(ValueError, "must not repeat"):
             validate_config(cfg)
+
+
+
+class BundledAddinTests(unittest.TestCase):
+    """End-to-end checks of the add-ins shipped in addin/."""
+
+    ADDIN = Path(__file__).parents[1] / "addin"
+
+    def _layout(self, **overrides) -> dict:
+        layout = {
+            "schema_version": "1.0", "status": "complete",
+            "source_file": "sheet.pdf", "output_key": "sheet.pdf-abc123",
+            "page": 1, "size": {"width": 400, "height": 200},
+            "coordinate_transform": {
+                "source_space": "pymupdf_unrotated_cropbox_points",
+                "source_to_pixel": [2.7778, 0, 0, 2.7778, 0, 0],
+                "pixel_to_source": [0.36, 0, 0, 0.36, 0, 0],
+                "render_dpi": 200},
+            "num_regions": 0, "regions": [], "warnings": []}
+        layout.update(overrides)
+        layout["num_regions"] = len(layout["regions"])
+        return layout
+
+    def _page(self, root: Path, layout: dict) -> Path:
+        page_dir = root / "page_001"
+        (page_dir / "vectors").mkdir(parents=True)
+        save_json(page_dir / "layout.json", layout)
+        for region in layout["regions"]:
+            if region.get("vector_file"):
+                save_json(page_dir / region["vector_file"],
+                          {"region_id": region["id"], "bbox": region["bbox"],
+                           "coordinate_system": "page_pixel", "num_polylines": 1,
+                           "num_groups": 1,
+                           "polylines": [{"id": "0", "points": [[10, 10], [100, 60]],
+                                          "closed": False, "length_px": 100.0,
+                                          "num_points": 2, "source": "raster", "group": "0"}]})
+        return page_dir
+
+    def _run(self, root: Path, page_dir: Path, layout: dict, settings=None, enabled=None):
+        cfg = load_config()
+        cfg["stages"] = {"addin_dir": str(self.ADDIN),
+                         "enabled": enabled or ["scale_calibrate", "dxf_export"],
+                         "on_error": "warn", "settings": settings or {}}
+        runner = StageRunner(cfg, root)
+        runner.setup()
+        ctx = runner.run_page(page_dir, layout)
+        return runner, ctx
+
+    def test_scale_resolves_pdf_points_exactly(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            layout = self._layout()
+            runner, ctx = self._run(root, self._page(root, layout), layout,
+                                    enabled=["scale_calibrate"])
+            self.assertEqual(runner.errors, [])
+            scale = ctx.artifact("scale").meta
+            # 0.36 pt per pixel -> 25.4/72 mm per point -> 7.874 px per mm
+            self.assertAlmostEqual(scale["px_per_mm_paper"], 7.874, places=2)
+            self.assertEqual(scale["method"], "pdf_point_transform")
+            self.assertEqual(scale["unit"], "mm")
+
+    def test_scale_falls_back_to_pixels_for_raster_input(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            layout = self._layout(coordinate_transform={
+                "source_space": "image_pixel",
+                "source_to_pixel": [1, 0, 0, 1, 0, 0],
+                "pixel_to_source": [1, 0, 0, 1, 0, 0]})
+            runner, ctx = self._run(root, self._page(root, layout), layout,
+                                    enabled=["scale_calibrate"])
+            self.assertEqual(runner.errors, [])
+            scale = ctx.artifact("scale").meta
+            self.assertEqual((scale["method"], scale["unit"], scale["confidence"]),
+                             ("pixel", "px", 0.0))
+
+            layout = self._layout(coordinate_transform={
+                "source_space": "image_pixel",
+                "source_to_pixel": [1, 0, 0, 1, 0, 0],
+                "pixel_to_source": [1, 0, 0, 1, 0, 0]})
+            page_dir = self._page(root / "scan", layout)
+            runner, ctx = self._run(root / "scan", page_dir, layout,
+                                    settings={"scale_calibrate": {"assume_scan_dpi": 300}},
+                                    enabled=["scale_calibrate"])
+            scale = ctx.artifact("scale").meta
+            self.assertEqual(scale["method"], "assumed_dpi")
+            self.assertAlmostEqual(scale["px_per_mm_paper"], 300 / 25.4, places=3)
+
+    def test_sheet_scale_is_read_from_the_parsed_text(self):
+        stage = load_stage(self.ADDIN, "scale_calibrate")
+        module = sys.modules["doc_layout_parser_addin_scale_calibrate"]
+        reads = {"SCALE 1:100": "100", "SCALE = 1/50": "50", "S=1:50": "50",
+                 "축척 1:200": "200", "scale1:30": "30", "척도 1/250": "250",
+                 # OCR turns the colon into a period on drawing text
+                 "SCALE 1.100": "100"}
+        for text, expected in reads.items():
+            found = module.SCALE_RE.search(text)
+            self.assertIsNotNone(found, text)
+            self.assertEqual(found.group(1), expected, text)
+        # Ratios printed all over a drawing must not be read as a sheet scale
+        for text in ("BARS 1:2", "SLOPE 1:10", "1:100", "RATIO 1 : 5", "STIRRUPS 1:4"):
+            self.assertIsNone(module.SCALE_RE.search(text), text)
+        self.assertEqual(stage.name, "scale_calibrate")
+
+    def test_scale_reports_denominator_without_a_physical_page(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            layout = self._layout(
+                coordinate_transform={"source_space": "image_pixel",
+                                      "source_to_pixel": [1, 0, 0, 1, 0, 0],
+                                      "pixel_to_source": [1, 0, 0, 1, 0, 0]},
+                regions=[{"id": "r001", "type": "annotation", "bbox": [10, 10, 90, 20],
+                          "source": "ocr", "confidence": 0.6, "confidence_kind": "ocr_score",
+                          "text": "SCALE 1:100"}])
+            runner, ctx = self._run(root, self._page(root, layout), layout,
+                                    enabled=["scale_calibrate"])
+            scale = ctx.artifact("scale").meta
+            self.assertEqual(scale["drawing_scale"], 100)
+            self.assertEqual(scale["scale_source_region"], "r001")
+            # Real-world size needs both halves, so it stays unresolved
+            self.assertIsNone(scale["mm_per_px_drawing"])
+            self.assertEqual(scale["confidence"], 0.0)
+
+    @unittest.skipUnless(importlib.util.find_spec("ezdxf"), "ezdxf is not installed")
+    def test_dxf_export_writes_a_readable_drawing(self):
+        import ezdxf
+        from ezdxf.enums import TextEntityAlignment
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            layout = self._layout(regions=[
+                {"id": "r001", "type": "drawing", "bbox": [10, 10, 100, 60],
+                 "source": "heuristic", "confidence": 0.8,
+                 "confidence_kind": "heuristic_score", "vector_file": "vectors/r001.json"},
+                {"id": "r002", "type": "text", "bbox": [120, 20, 300, 40],
+                 "source": "ocr", "confidence": 0.9, "confidence_kind": "ocr_score",
+                 "text": "BEAM SCHEDULE"}])
+            page_dir = self._page(root, layout)
+            runner, ctx = self._run(root, page_dir, layout)
+            self.assertEqual(runner.errors, [])
+
+            produced = ctx.artifact("dxf")
+            self.assertIsNotNone(produced)
+            doc = ezdxf.readfile(produced.path)
+            self.assertEqual(doc.header["$INSUNITS"], 4)
+            kinds = {}
+            for entity in doc.modelspace():
+                kinds[entity.dxftype()] = kinds.get(entity.dxftype(), 0) + 1
+            self.assertEqual(kinds, {"LWPOLYLINE": 1, "TEXT": 1})
+
+            text = next(e for e in doc.modelspace() if e.dxftype() == "TEXT")
+            self.assertEqual(text.dxf.layer, "TEXT")
+            align, left, right = text.get_placement()
+            # FIT keeps the height and confines the string to the region's width
+            self.assertEqual(align, TextEntityAlignment.FIT)
+            self.assertAlmostEqual(right[0] - left[0], (300 - 120) / 7.874, places=2)
+
+            line = next(e for e in doc.modelspace() if e.dxftype() == "LWPOLYLINE")
+            self.assertEqual(line.dxf.layer, "DRAWING")
+            points = line.get_points("xy")
+            # y is flipped once: page pixel 10 from the top of a 200 px page
+            self.assertAlmostEqual(points[0][0], 10 / 7.874, places=3)
+            self.assertAlmostEqual(points[0][1], (200 - 10) / 7.874, places=3)
+
+    @unittest.skipUnless(importlib.util.find_spec("ezdxf"), "ezdxf is not installed")
+    def test_document_hook_indexes_every_page(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            layout = self._layout(regions=[
+                {"id": "r001", "type": "drawing", "bbox": [10, 10, 100, 60],
+                 "source": "heuristic", "confidence": 0.8,
+                 "confidence_kind": "heuristic_score", "vector_file": "vectors/r001.json"}])
+            page_dir = self._page(root, layout)
+            cfg = load_config()
+            cfg["stages"] = {"addin_dir": str(self.ADDIN),
+                             "enabled": ["scale_calibrate", "dxf_export"],
+                             "on_error": "warn", "settings": {}}
+            runner = StageRunner(cfg, root)
+            runner.setup()
+            page_ctx = runner.run_page(page_dir, layout)
+            runner.run_document(root, {"source_file": "sheet.pdf",
+                                       "output_key": "sheet.pdf-abc123"}, [page_ctx])
+            self.assertEqual(runner.errors, [])
+            index = json.loads((root / "stages/dxf_export/index.json").read_text())
+            self.assertEqual(index["source_file"], "sheet.pdf")
+            self.assertEqual([p["page"] for p in index["pages"]], [1])
+
+    def test_unknown_settings_are_refused(self):
+        for stage_name, block in (("scale_calibrate", {"reed_title_block": True}),
+                                  ("dxf_export", {"unit": "mm"})):
+            stage = load_stage(self.ADDIN, stage_name)
+            with self.assertRaisesRegex(ValueError, "Unknown"):
+                stage.setup(block)
 
 
 class EvaluationTests(unittest.TestCase):
