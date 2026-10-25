@@ -52,12 +52,9 @@ class DxfExport(Stage):
     provides = ("dxf",)
 
     def setup(self, cfg: dict) -> None:
-        import ezdxf                                  # add-in's own dependency
-        from ezdxf.enums import TextEntityAlignment
-        self._ezdxf = ezdxf
-        self._fit = TextEntityAlignment.FIT
-        self._left = TextEntityAlignment.LEFT
-
+        # Settings are checked before the optional dependency is imported: a
+        # typo in config.json is worth reporting whether or not ezdxf is here,
+        # and it is the more actionable of the two failures.
         unknown = set(cfg) - set(DEFAULTS) - {"budget_sec"}
         if unknown:
             raise ValueError(f"Unknown dxf_export setting(s): {sorted(unknown)}")
@@ -68,6 +65,13 @@ class DxfExport(Stage):
                     "min_fit_width_ratio", "char_width_ratio"):
             if not isinstance(self.cfg[key], (int, float)) or self.cfg[key] <= 0:
                 raise ValueError(f"dxf_export.{key} must be a positive number")
+
+        import ezdxf                                  # add-in's own dependency
+        from ezdxf.enums import TextEntityAlignment
+        self._ezdxf = ezdxf
+        self._fit = TextEntityAlignment.FIT
+        self._left = TextEntityAlignment.LEFT
+
         self.units = self.cfg["units"]
         self.use_drawing_scale = self.cfg["use_drawing_scale"]
         self.min_text_height = float(self.cfg["min_text_height_mm"])
