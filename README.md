@@ -629,6 +629,7 @@ records, not published page links.
 
 | Date | Change |
 |---|---|
+| 2026-10-25 | Add-in refinements: DXF text fitted to its region, raster input resolved to pixel units instead of failing, sheet-scale reading widened for OCR, tuned values moved into stage settings, add-in dependencies documented |
 | 2026-10-11 | Add-in stages (`addin/`): user modules run after the parse and emit new formats, with `scale_calibrate` and `dxf_export` bundled. Page `layout.json` now names its source document. |
 | 2026-09-28 | CLI processing options documented and extended |
 | 2026-09-26 | pip packaging, local processing controls in the viewer, bilingual viewer with an interactive demo, README consolidation |
