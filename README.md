@@ -267,7 +267,15 @@ python -m pip install .
 python -m pip install ".[ollama]"
 # python -m pip install ".[openai]"
 # python -m pip install ".[gemini]"
+
+# Dependencies of the bundled add-ins (ezdxf, needed by dxf_export)
+python -m pip install ".[addin]"
 ```
+
+Each add-in declares its own dependencies in `addin/<name>/requirements.txt`.
+An add-in whose dependency is missing fails in `setup()`, is skipped for the
+run and is listed under `stage_errors` in `result.json`; the parse itself still
+completes.
 
 To install directly from GitHub without cloning first:
 

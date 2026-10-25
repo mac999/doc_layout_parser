@@ -24,6 +24,7 @@ dependencies = [
 ollama = ["ollama>=0.6"]
 openai = ["openai>=2.0"]
 gemini = ["google-genai>=2.0"]
+addin = ["ezdxf>=1.4"]
 
 [project.scripts]
 doc-layout-parser = "main:main"

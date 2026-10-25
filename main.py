@@ -295,7 +295,7 @@ def main():
         print(f"Ready: {len(files)} inputs; OCR device: {'CUDA' if cfg['ocr']['gpu'] else 'CPU'}")
         return 0
 
-    ok, failed, skipped = 0, 0, 0
+    ok, failed, skipped, stage_errors = 0, 0, 0, 0
     for f in files:
         try:
             result = process_file(f, cfg, out_root, warnings, markdown=args.markdown,
@@ -304,9 +304,14 @@ def main():
                 skipped += 1
             else:
                 ok += 1
+                stage_errors += len(result.get("stage_errors", []))
         except Exception:
             failed += 1
             print(f"[FAILED] {f.name}\n{traceback.format_exc()}")
+    # A stage that fails in setup() produces nothing for the whole run, so say so
+    # here rather than leaving the user to find an empty output directory.
+    if stage_errors:
+        print(f"[WARN] {stage_errors} add-in stage error(s); see stage_errors in result.json")
     print(f"\nDone: {ok} succeeded, {skipped} skipped, {failed} failed -> {out_root}")
     return 0 if failed == 0 else 1
 
