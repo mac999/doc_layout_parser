@@ -18,6 +18,19 @@ addin/
     ...                 # helper modules, model weights, whatever it needs
 ```
 
+Dependencies are the add-in's own. Declare them in `requirements.txt` beside
+`stage.py` and install them before enabling the stage:
+
+```bash
+pip install -r addin/dxf_export/requirements.txt
+```
+
+The bundled add-ins are also reachable as a package extra:
+`pip install ".[addin]"`. An add-in whose dependency is missing raises in
+`setup()`, which skips that stage for the whole run and records the reason in
+`result.json`; the parse still completes, so check `stage_errors` when a stage
+produces nothing.
+
 The folder name is the stage identity. It is what `stages.enabled` lists, what
 `stages.settings` is keyed by, and what the output directory is named. A class
 that declares a different `name` is rejected at load time rather than becoming
@@ -45,7 +58,7 @@ instance is clearer and is what the bundled add-ins do.
   "enabled": ["scale_calibrate", "dxf_export"],
   "on_error": "warn",
   "settings": {
-    "scale_calibrate": {"read_title_block": true},
+    "scale_calibrate": {"read_title_block": true, "assume_scan_dpi": null},
     "dxf_export": {"units": "mm", "use_drawing_scale": true}
   }
 }
@@ -238,20 +251,46 @@ a drawing PDF into one DXF per page.
 millimetre, which splits into two separate questions:
 
 - *paper* millimetres come exactly from the PDF point transform or the render
-  DPI, with no model involved
+  DPI, with no model involved. A raster scan carries no physical size at all, so
+  it reports pixel units with confidence 0 unless `assume_scan_dpi` is given
 - *drawing* millimetres need the scale denominator printed in the title block,
   which has to be read
 
-It always resolves the first, resolves the second only when it finds
-`SCALE 1:N` in the text the parser already extracted, and reports `confidence`
-either way so a later stage can refuse to act on a guess. On the bundled
-`img3.pdf` no scale is printed, so it reports `drawing_scale: null` with
-confidence 0 rather than inventing one.
+Both halves are needed for real-world size, and each is reported separately with
+a `confidence` a later stage can refuse to act on. On the bundled `img3.pdf` no
+scale is printed, so it reports `drawing_scale: null` rather than inventing one.
+
+The separator in `SCALE 1:100` also accepts `.`, `;` and `-`, because OCR
+confuses them on drawing text — a real sheet was read as `SCALE 1.100`. A bare
+`1:2` is deliberately not accepted: ratios appear throughout a drawing and would
+be mistaken for a sheet scale. Requiring the keyword is what keeps the loose
+separator safe.
+
+| setting | default | meaning |
+|---|---|---|
+| `read_title_block` | `true` | look for a printed sheet scale |
+| `assume_scan_dpi` | `null` | scanner DPI, so a raster input yields millimetres |
+| `assume_drawing_scale` | `null` | denominator to use when none is printed |
 
 **`dxf_export`** requires `scale` and provides `dxf`. It is deterministic:
 polylines become `LWPOLYLINE`, text regions become `TEXT`, table cells become
 closed rectangles plus their text, each on a layer named after the region type.
 The y axis is flipped once, in one function.
+
+Text uses `FIT` alignment between the region's own left and right edges. A height
+taken from the bounding box alone overflowed the region for 52 of 54 strings on
+one sheet, because the source glyphs are narrower than the default DXF font;
+`FIT` keeps the height and condenses the width instead.
+
+| setting | default | meaning |
+|---|---|---|
+| `units` | `"mm"` | `mm` or `m`; sets `$INSUNITS` |
+| `use_drawing_scale` | `true` | emit real-world size when the sheet scale is known |
+| `write_text`, `write_tables` | `true` | include text entities / table cell grids |
+| `min_text_height_mm` | `1.0` | floor for text height |
+| `text_height_ratio` | `0.8` | bbox height to cap height |
+| `min_fit_width_ratio` | `0.1` | below this multiple of the height, left-align instead of fitting |
+| `layers` | see `stage.py` | region type to `[layer name, colour]` |
 
 The split is deliberate. The judgement that can be wrong lives in one small
 stage that reports its own confidence; the writer stays mechanical and testable.
@@ -277,6 +316,8 @@ python main.py -i input/img3.pdf
 ## Checklist
 
 - the folder name, the `enabled` entry and the `settings` key are the same string
+- settings have declared defaults and `setup()` rejects keys it does not know,
+  the way the core validates `config.json`
 - `stage.py` exports `STAGE`
 - models load in `setup()`, not in `on_page()`
 - hooks return a list of `Artifact`
